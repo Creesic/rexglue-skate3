@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <set>
 #include <string>
@@ -397,8 +398,9 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
   // If no binding for this fetch slot is found create it.
   using VertexBinding = Shader::VertexBinding;
   VertexBinding::Attribute* attrib = nullptr;
+  const uint32_t fetch_constant_index = fetch_instr.operands[1].storage_index;
   for (auto& vertex_binding : vertex_bindings_) {
-    if (vertex_binding.fetch_constant == op.fetch_constant_index()) {
+    if (vertex_binding.fetch_constant == fetch_constant_index) {
       // It may not hold that all strides are equal, but I hope it does.
       assert_true(!fetch_instr.attributes.stride ||
                   vertex_binding.stride_words == fetch_instr.attributes.stride);
@@ -411,7 +413,7 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
     assert_not_zero(fetch_instr.attributes.stride);
     VertexBinding vertex_binding;
     vertex_binding.binding_index = int(vertex_bindings_.size());
-    vertex_binding.fetch_constant = op.fetch_constant_index();
+    vertex_binding.fetch_constant = fetch_constant_index;
     vertex_binding.stride_words = fetch_instr.attributes.stride;
     vertex_binding.attributes.push_back({});
     vertex_bindings_.emplace_back(std::move(vertex_binding));
@@ -586,6 +588,9 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
       break;
     case InstructionStorageTarget::kDepth:
       writes_depth_ = true;
+      break;
+    case InstructionStorageTarget::kStencilReference:
+      writes_stencil_reference_ = true;
       break;
     default:
       break;
@@ -1241,6 +1246,7 @@ void ParseAluInstruction(const AluInstruction& op, xenos::ShaderType shader_type
 
   InstructionStorageTarget storage_target = InstructionStorageTarget::kRegister;
   uint32_t storage_index_export = 0;
+  bool ignore_pixel_position_export = false;
   if (is_export) {
     storage_target = InstructionStorageTarget::kNone;
     // Both vector and scalar operation export to vector_dest.
@@ -1269,9 +1275,30 @@ void ParseAluInstruction(const AluInstruction& op, xenos::ShaderType shader_type
         storage_index_export = uint32_t(export_register) - uint32_t(ExportRegister::kPSColor0);
       } else if (export_register == ExportRegister::kPSDepth) {
         storage_target = InstructionStorageTarget::kDepth;
+      } else if (export_register == ExportRegister::kVSPosition) {
+        // Some pixel shaders (PGR3 render target unpack passes) contain an
+        // alloc-position export. It's not a stencil export, and routing it to
+        // gl_FragStencilRef produces invalid stores for the YZW component
+        // writes. Ignore it; the color exports in the same shader carry the
+        // actual render-target data.
+        ignore_pixel_position_export = true;
       }
     }
-    if (storage_target == InstructionStorageTarget::kNone) {
+    if (shader_type == xenos::ShaderType::kPixel) {
+      static uint32_t debug_pixel_export_log_count = 0;
+      if (debug_pixel_export_log_count < 192) {
+        std::fprintf(stderr,
+                     "[rexglue-shader] pixel export #%u reg=%u target=%u target_index=%u "
+                     "vector_mask=%X const0=%X const1=%X scalar_mask=%X\n",
+                     debug_pixel_export_log_count, uint32_t(export_register),
+                     uint32_t(storage_target), storage_index_export,
+                     op.GetVectorOpResultWriteMask(), op.GetConstant0WriteMask(),
+                     op.GetConstant1WriteMask(), op.GetScalarOpResultWriteMask());
+        std::fflush(stderr);
+        ++debug_pixel_export_log_count;
+      }
+    }
+    if (storage_target == InstructionStorageTarget::kNone && !ignore_pixel_position_export) {
       assert_always();
       REXGPU_ERROR(
           "ShaderTranslator::ParseAluInstruction: Unsupported write to export "

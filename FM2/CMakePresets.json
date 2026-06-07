@@ -1,0 +1,217 @@
+{
+  "buildPresets": [
+    {
+      "configurePreset": "win-amd64-debug",
+      "name": "win-amd64-debug"
+    },
+    {
+      "configurePreset": "win-amd64-release",
+      "name": "win-amd64-release"
+    },
+    {
+      "configurePreset": "win-amd64-relwithdebinfo",
+      "name": "win-amd64-relwithdebinfo"
+    },
+    {
+      "configurePreset": "linux-amd64-debug",
+      "name": "linux-amd64-debug"
+    },
+    {
+      "configurePreset": "linux-amd64-release",
+      "name": "linux-amd64-release"
+    },
+    {
+      "configurePreset": "linux-amd64-relwithdebinfo",
+      "name": "linux-amd64-relwithdebinfo"
+    },
+    {
+      "configurePreset": "win-arm64-debug",
+      "name": "win-arm64-debug"
+    },
+    {
+      "configurePreset": "win-arm64-release",
+      "name": "win-arm64-release"
+    },
+    {
+      "configurePreset": "win-arm64-relwithdebinfo",
+      "name": "win-arm64-relwithdebinfo"
+    },
+    {
+      "configurePreset": "linux-arm64-debug",
+      "name": "linux-arm64-debug"
+    },
+    {
+      "configurePreset": "linux-arm64-release",
+      "name": "linux-arm64-release"
+    },
+    {
+      "configurePreset": "linux-arm64-relwithdebinfo",
+      "name": "linux-arm64-relwithdebinfo"
+    }
+  ],
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+        "CMAKE_C_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe"
+      },
+      "condition": {
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows",
+        "type": "equals"
+      },
+      "environment": {
+        "INCLUDE": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/winrt",
+        "LIB": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64"
+      },
+      "generator": "Ninja",
+      "hidden": true,
+      "name": "windows-base"
+    },
+    {
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++-20",
+        "CMAKE_C_COMPILER": "clang-20"
+      },
+      "condition": {
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux",
+        "type": "equals"
+      },
+      "generator": "Ninja",
+      "hidden": true,
+      "name": "linux-base"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../out/install/win-amd64"
+      },
+      "hidden": true,
+      "inherits": "windows-base",
+      "name": "windows-amd64-base"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../out/install/win-arm64",
+        "CMAKE_CXX_FLAGS": "-march=armv8-a",
+        "CMAKE_C_FLAGS": "-march=armv8-a"
+      },
+      "hidden": true,
+      "inherits": "windows-base",
+      "name": "windows-arm64-base"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-march=armv8-a",
+        "CMAKE_C_FLAGS": "-march=armv8-a"
+      },
+      "hidden": true,
+      "inherits": "linux-base",
+      "name": "linux-arm64-base"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "displayName": "Windows AMD64 Debug",
+      "inherits": "windows-amd64-base",
+      "name": "win-amd64-debug"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "Windows AMD64 Release",
+      "inherits": "windows-amd64-base",
+      "name": "win-amd64-release"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "displayName": "Linux AMD64 Debug",
+      "inherits": "linux-base",
+      "name": "linux-amd64-debug"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "Linux AMD64 Release",
+      "inherits": "linux-base",
+      "name": "linux-amd64-release"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "Windows AMD64 RelWithDebInfo",
+      "inherits": "windows-amd64-base",
+      "name": "win-amd64-relwithdebinfo"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "Linux AMD64 RelWithDebInfo",
+      "inherits": "linux-base",
+      "name": "linux-amd64-relwithdebinfo"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "displayName": "Windows ARM64 Debug",
+      "inherits": "windows-arm64-base",
+      "name": "win-arm64-debug"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "Windows ARM64 Release",
+      "inherits": "windows-arm64-base",
+      "name": "win-arm64-release"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "Windows ARM64 RelWithDebInfo",
+      "inherits": "windows-arm64-base",
+      "name": "win-arm64-relwithdebinfo"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "displayName": "Linux ARM64 Debug",
+      "inherits": "linux-arm64-base",
+      "name": "linux-arm64-debug"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "Linux ARM64 Release",
+      "inherits": "linux-arm64-base",
+      "name": "linux-arm64-release"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "Linux ARM64 RelWithDebInfo",
+      "inherits": "linux-arm64-base",
+      "name": "linux-arm64-relwithdebinfo"
+    }
+  ],
+  "version": 6
+}

@@ -135,7 +135,29 @@ class CommandProcessor {
 
   void UpdateWritePointer(uint32_t value);
 
-  void ExecutePacket(uint32_t ptr, uint32_t count);
+  bool ExecutePacket(uint32_t ptr, uint32_t count);
+
+  bool has_primary_ring_buffer() const { return primary_buffer_size_ != 0; }
+  bool has_seen_write_pointer() const { return seen_write_pointer_.load(); }
+  uint32_t primary_ring_buffer_ptr() const { return primary_buffer_ptr_; }
+  uint32_t primary_ring_buffer_size() const { return primary_buffer_size_; }
+  bool IsPhysicalRangeInPrimaryRingBuffer(uint32_t ptr, uint32_t length) const {
+    if (!primary_buffer_size_ || !length) {
+      return false;
+    }
+    const uint32_t end = ptr + length;
+    const uint32_t ring_end = primary_buffer_ptr_ + primary_buffer_size_;
+    return end > ptr && ring_end > primary_buffer_ptr_ && ptr >= primary_buffer_ptr_ &&
+           end <= ring_end;
+  }
+  bool gpu_busy() const { return gpu_busy_.load(); }
+  void RequestDeferredInterrupt() { interrupt_sources_pending_ = true; }
+  bool TakeDeferredInterruptPending() { return interrupt_sources_pending_.exchange(false); }
+  void SetPendingSwapFrontbuffer(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                 uint32_t frontbuffer_height);
+  bool ConsumePendingSwapFrontbufferForResolve(uint32_t resolved_ptr, uint32_t resolved_length,
+                                               uint32_t& frontbuffer_width,
+                                               uint32_t& frontbuffer_height);
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -186,7 +208,8 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
-  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+  bool ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+  bool HandleIncompletePacket(memory::RingBuffer* reader, const char* reason);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
@@ -265,6 +288,7 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
+  std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
 
   // MicroEngine binary from PM4_ME_INIT
@@ -275,12 +299,22 @@ class CommandProcessor {
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
 
-  uint32_t read_ptr_index_ = 0;
+  std::atomic<uint32_t> read_ptr_index_{0};
   uint32_t read_ptr_update_freq_ = 0;
   uint32_t read_ptr_writeback_ptr_ = 0;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
-  std::atomic<uint32_t> write_ptr_index_;
+  std::atomic<uint32_t> write_ptr_index_{0};
+  std::atomic<bool> seen_write_pointer_{false};
+  bool retry_command_stream_packet_ = false;
+  std::atomic<bool> gpu_busy_{false};
+  std::atomic<bool> interrupt_sources_pending_{false};
+  std::mutex pending_swap_frontbuffer_mutex_;
+  uint32_t pending_swap_frontbuffer_ptr_ = 0;
+  uint32_t pending_swap_frontbuffer_width_ = 0;
+  uint32_t pending_swap_frontbuffer_height_ = 0;
+  uint64_t pending_swap_frontbuffer_generation_ = 0;
+  uint64_t consumed_swap_frontbuffer_generation_ = 0;
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

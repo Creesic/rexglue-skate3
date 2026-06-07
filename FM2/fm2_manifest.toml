@@ -1,0 +1,174 @@
+[project]
+sdk_version = "0.8.1.4"
+name = "fm2"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated"
+
+setjmp_address = 0x82418560
+longjmp_address = 0x82418210
+
+
+[entrypoint.functions]
+0x824E5A48 = { name = "FM2_Noop" }
+0x825DCAD8 = { name = "FM2_GetObject20CJumpTo03BB8" }
+0x8227BD08 = { name = "FM2_StartQueuedTask_VTable8200F160" }
+0x822792A0 = { name = "FM2_StartQueuedTask_VTable8200ECF4" }
+0x8243C058 = { name = "FM2_GetStreamBytesRead" }
+0x823f7a48 = { name = "FM2_BranchThunkToSub823F76A0" }
+0x827C3D1C = { name = "FM2_FloatPhaseWrapClamp" }
+0x823F8A24 = { name = "FM2_AdjustorThunkTable_823F8A24" }
+0x8266A7CC = { name = "FM2_BranchThunk_ReturnSuccess" }
+0x823F79F4 = { name = "FM2_AdjustorThunkTable_823F79F4" }
+0x827CBAB0 = { name = "FM2_FloatPhaseWrapClamp_Alias" }
+0x823F70A0 = { name = "FM2_AdjustorThunk_Add4_To823F2FC8" }
+0x8266A7BC = { name = "FM2_ReturnSuccess" }
+0x827A7034 = { name = "FM2_EHCleanup_ConstructArray4176_Init" }
+0x8279FF14 = { name = "FM2_EHCleanup_ConstructArray40_A" }
+0x8276C388 = { name = "FM2_EHCleanup_ConstructArray40_B" }
+0x8277EBF0 = { name = "FM2_EHCleanup_ListNodeBundle_7EBF0" }
+0x82768AD4 = { name = "FM2_EHCleanup_Array4_68AD4" }
+0x827A1A04 = { name = "FM2_STL_CleanupArray40_D" }
+0x827A7AB8 = { name = "FM2_STL_ConstructArray4176" }
+0x827A7B94 = { name = "FM2_STL_CleanupArray4176_A" }
+0x827F9E80 = { name = "FM2_EHCleanup_ListNodeBundle_F9D20" }
+0x827F9D20 = { name = "FM2_InitListNodeBundle_F9D20" }
+0x827FD400 = { name = "FM2_InitListNodeBundle_FD400" }
+0x827FD560 = { name = "FM2_EHCleanup_ListNodeBundle_FD400" }
+0x82768510 = { name = "FM2_STL_ConstructArray4" }
+0x827685EC = { name = "FM2_STL_CleanupArray4" }
+0x827A0468 = { name = "FM2_InitListNodeBundle_A0468" }
+0x827A05C8 = { name = "FM2_EHCleanup_ListNodeBundle_A0468" }
+0x8276C930 = { name = "FM2_STL_ConstructArray40_A" }
+0x8276CFA4 = { name = "FM2_STL_CleanupArray40_B" }
+0x8276CA0C = { name = "FM2_STL_CleanupArray40_A" }
+0x8276CEC0 = { name = "FM2_STL_CopyConstructRange40_A" }
+0x82785F88 = { name = "FM2_InitListNodeBundle_85F88" }
+0x827860E8 = { name = "FM2_EHCleanup_ListNodeBundle_85F88" }
+0x827A0F50 = { name = "FM2_InitListNodeBundle_A0F50" }
+0x827A10AC = { name = "FM2_EHCleanup_ListNodeBundle_A0F50" }
+0x827A1CD4 = { name = "FM2_STL_CleanupArray40_C" }
+0x827A1BF0 = { name = "FM2_STL_CopyConstructRange40_B" }
+0x827A7F54 = { name = "FM2_STL_CleanupArray4176_B" }
+0x827A7E70 = { name = "FM2_STL_CopyConstructRange4176" }
+0x827AE678 = { name = "FM2_STL_CopyConstructRange8" }
+0x827AE75C = { name = "FM2_STL_CleanupArray8" }
+0x823e9c30 = { name = "FM2_ByteDispatchTableCall" }
+0x823e9bf0 = { name = "FM2_ReleaseObjectMinus8" }
+0x82680d58 = { name = "FM2_RangeCheckedCurveCallback" }
+0x8266d6f8 = { name = "FM2_Thunk_InvokeB2F8_DefaultZero" }
+0x826a8600 = { name = "FM2_StateGateForwardToDFE0" }
+0x8243f898 = { name = "FM2_ValidateFlagThenCallF810" }
+0x822544b0 = { name = "FM2_AtomicAddRef" }
+0x8243c140 = { name = "FM2_BufferedFileReadAsyncAware" }
+0x8243c8d0 = { name = "FM2_BufferedFileRead" }
+0x82276a88 = { name = "FM2_DeferredVFunc0C_ByteParamCallback" }
+0x821D3EE8 = { name = "FM2_DeferredAudioManagerUpdateCallback" }
+0x8227d098 = { name = "FM2_DeferredVFuncD4_ThreeQwordCallback" }
+0x825b31a0 = { name = "FM2_BitMaskCallSub8236C208" }
+0x825b3288 = { name = "FM2_BitMaskCallSub82370E48" }
+0x8242a3c8 = { name = "FM2_CallNestedObjectIfEnabled" }
+0x8234d4f8 = { name = "FM2_ClearListEntryBlendWeights" }
+0x825e58f0 = { name = "FM2_Thunk_CallSub825E5398_Global54" }
+0x82610218 = { name = "FM2_LookupNestedObjectByKey" }
+0x82277548 = { name = "FM2_VCallThunk58" }
+0x8260E718 = { name = "FM2_InvokeChildStateReset" }
+0x82551CF8 = { name = "FM2_CallSub82551B30_Flag1" }
+0x825DCAE0 = { name = "FM2_GetObject20CJumpTo03BC8" }
+0x82278698 = { name = "FM2_DeferredVFuncD0_TwoU32Callback" }
+0x82575598 = { name = "FM2_VCallThunk7C_FloatParam" }
+0x82279010 = { name = "FM2_DeferredVFunc40_TwoU32Callback" }
+0x82573CA8 = { name = "FM2_VCallThunk18_FloatParam" }
+
+# Hook-containing functions we identified in IDA. Adding them here gives
+# regenerated code useful symbols instead of sub_XXXXXXXX in crash stacks.
+0x821D3F00 = { name = "FM2_QueueDeferredAudioManagerUpdate" }
+0x82276AA0 = { name = "FM2_QueueDeferredVFunc0C_ByteParam" }
+0x822786B0 = { name = "FM2_QueueDeferredVFuncD0_TwoU32Params" }
+0x82279028 = { name = "FM2_QueueDeferredVFunc40_TwoU32Params" }
+0x8227D0B8 = { name = "FM2_QueueDeferredVFuncD4_ThreeQwordParams" }
+0x8234D348 = { name = "FM2_UpdateListEntriesAndNotifyManager" }
+0x8234D5A8 = { name = "FM2_TriggerMatchingListEntryActions" }
+0x82375A40 = { name = "FM2_D3D_BeginCommandBufferBatch" }
+0x82375ED0 = { name = "FM2_D3D_EmitDirtyStateAndDrawList" }
+0x82376A58 = { name = "FM2_D3D_FinalizeCommandBufferBatch" }
+0x82540160 = { name = "FM2_SpliceResultObjectsIntoList" }
+0x82551D08 = { name = "FM2_FindAndReplaceDelimitedTextRange" }
+0x82603BE0 = { name = "FM2_ReleaseOwnedChildObjects" }
+
+[[entrypoint.midasm_hook]]
+address = 0x82603C28
+name = "FM2SkipBadChildSlot"
+registers = ["r11", "r31"]
+after_instruction = true
+jump_address_on_true = 0x82603C48
+
+[[entrypoint.midasm_hook]]
+address = 0x8242A3D4
+name = "FM2ReturnZeroOnBadNestedVcall"
+registers = ["r3"]
+after_instruction = true
+jump_address_on_true = 0x8242A3E8
+
+[[entrypoint.midasm_hook]]
+address = 0x8234D378
+name = "FM2ReturnOnBadListHead"
+registers = ["r10"]
+after_instruction = true
+jump_address_on_true = 0x8234D4EC
+
+[[entrypoint.midasm_hook]]
+address = 0x8234D5E4
+name = "FM2ReturnOnBadD5A8ListHead"
+registers = ["r11"]
+after_instruction = true
+jump_address_on_true = 0x8234D6B4
+
+[[entrypoint.midasm_hook]]
+address = 0x8234D518
+name = "FM2ReturnOnBadD4F8ListHead"
+registers = ["r10"]
+after_instruction = true
+jump_address_on_true = 0x8234D590
+
+[[entrypoint.midasm_hook]]
+address = 0x82375A4C
+name = "FM2ReturnOnBad75A40Object"
+registers = ["r30"]
+after_instruction = true
+jump_address_on_true = 0x82375EC4
+
+[[entrypoint.midasm_hook]]
+address = 0x82376A68
+name = "FM2ReturnZeroOnBad76A58Object"
+registers = ["r30", "r29"]
+after_instruction = true
+jump_address_on_true = 0x82376BF8
+
+[[entrypoint.midasm_hook]]
+address = 0x82375EE0
+name = "FM2ReturnOnBad75ED0Mask"
+registers = ["r25"]
+after_instruction = true
+jump_address_on_true = 0x823764A8
+
+[[entrypoint.midasm_hook]]
+address = 0x825401D4
+name = "FM2ReturnOnBad40160PrimaryResult"
+registers = ["r25"]
+after_instruction = true
+jump_address_on_true = 0x8254038C
+
+[[entrypoint.midasm_hook]]
+address = 0x82288D1C
+name = "FM2SpinWaitYield"
+registers = ["f0", "f31"]
+return_on_true = true
+
+[entrypoint.rexcrt]
+ConvertThreadToFiber = 0x82754CD0
+ConvertFiberToThread = 0x82754D60
+CreateFiber = 0x82754DB0
+DeleteFiber = 0x82754E90
+SwitchToFiber = 0x82754EF0

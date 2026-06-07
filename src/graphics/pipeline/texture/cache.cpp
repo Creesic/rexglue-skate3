@@ -1249,7 +1249,8 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
-  if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+  if (!REXCVAR_GET(vulkan_debug_swap_ignore_scaled_resolve) && IsDrawResolutionScaled() &&
+      key.tiled && IsScaledResolveSupportedForFormat(key)) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
          IsRangeScaledResolved(key.base_page << 12,

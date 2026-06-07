@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -42,6 +43,13 @@
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(vulkan_debug_resolve_test_pattern, 0, "GPU/Vulkan",
+                     "Debug only: inject known data before resolve copy: 0 off, "
+                     "1 fill EDRAM with solid white")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 // DEFINE_string(
 //     render_target_path_vulkan, "",
@@ -1379,6 +1387,27 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+    static uint32_t get_resolve_info_fail_log_count = 0;
+    if (get_resolve_info_fail_log_count < 64) {
+      const auto rb_copy_control = register_file().Get<reg::RB_COPY_CONTROL>();
+      const auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+      const auto vfetch0 = register_file().GetVertexFetch(0);
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache::Resolve GetResolveInfo failed #{} copy_command={} "
+          "surface_pitch={} msaa={} vfetch0_type={} vfetch0_size={} vfetch0_addr={:08X}",
+          get_resolve_info_fail_log_count, uint32_t(rb_copy_control.copy_command),
+          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+          uint32_t(vfetch0.type), uint32_t(vfetch0.size), vfetch0.address << 2);
+      std::fprintf(
+          stderr,
+          "[rexglue-vulkan] Resolve GetResolveInfo failed #%u copy_command=%u "
+          "surface_pitch=%u msaa=%u vfetch0_type=%u vfetch0_size=%u vfetch0_addr=%08X\n",
+          get_resolve_info_fail_log_count, uint32_t(rb_copy_control.copy_command),
+          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+          uint32_t(vfetch0.type), uint32_t(vfetch0.size), vfetch0.address << 2);
+      std::fflush(stderr);
+      ++get_resolve_info_fail_log_count;
+    }
     return false;
   }
 
@@ -1425,6 +1454,19 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
+            static uint32_t dump_render_targets_fail_log_count = 0;
+            if (dump_render_targets_fail_log_count < 128) {
+              std::fprintf(
+                  stderr,
+                  "[rexglue-vulkan] Resolve DumpRenderTargets failed #%u dump_base=%08X "
+                  "row_length=%u rows=%u pitch=%u dest_base=%08X dest_extent=%08X+%X "
+                  "scaled=%u\n",
+                  dump_render_targets_fail_log_count, dump_base, dump_row_length_used, dump_rows,
+                  dump_pitch, resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+                  resolve_info.copy_dest_extent_length, draw_resolution_scaled ? 1u : 0u);
+              std::fflush(stderr);
+              ++dump_render_targets_fail_log_count;
+            }
             return false;
           }
         }
@@ -1448,6 +1490,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
               "VulkanRenderTargetCache: Failed to map scaled resolve "
               "destination range (base={:08X}, length={:08X})",
               resolve_info.copy_dest_base, copy_dest_range_unscaled);
+          static uint32_t scaled_resolve_range_fail_log_count = 0;
+          if (scaled_resolve_range_fail_log_count < 64) {
+            std::fprintf(
+                stderr,
+                "[rexglue-vulkan] Resolve scaled destination map failed #%u dest_base=%08X "
+                "range_unscaled=%X dest_extent=%08X+%X bpe_log2=%u\n",
+                scaled_resolve_range_fail_log_count, resolve_info.copy_dest_base,
+                copy_dest_range_unscaled, resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length, uint32_t(copy_shader_info.dest_bpe_log2));
+            std::fflush(stderr);
+            ++scaled_resolve_range_fail_log_count;
+          }
           return false;
         }
       }
@@ -1480,6 +1534,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         REXGPU_ERROR(
             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
+        static uint32_t copy_dest_commit_fail_log_count = 0;
+        if (copy_dest_commit_fail_log_count < 64) {
+          std::fprintf(stderr,
+                       "[rexglue-vulkan] Resolve destination commit failed #%u dest_base=%08X "
+                       "range_unscaled=%X dest_extent=%08X+%X scaled=%u bpe_log2=%u\n",
+                       copy_dest_commit_fail_log_count, resolve_info.copy_dest_base,
+                       copy_dest_range_unscaled, resolve_info.copy_dest_extent_start,
+                       resolve_info.copy_dest_extent_length, draw_resolution_scaled ? 1u : 0u,
+                       uint32_t(copy_shader_info.dest_bpe_log2));
+          std::fflush(stderr);
+          ++copy_dest_commit_fail_log_count;
+        }
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
@@ -1510,11 +1576,60 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Submit the resolve.
           if (draw_resolution_scaled) {
-            texture_cache.UseScaledResolveBufferForWrite(copy_dest_base, copy_dest_range_length);
+            texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
           } else {
             shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),
                                                             uint32_t(copy_dest_use_length)));
+          }
+          if (REXCVAR_GET(vulkan_debug_resolve_test_pattern) == 1) {
+            UseEdramBuffer(EdramBufferUsage::kTransferWrite);
+            command_processor_.SubmitBarriers(true);
+            command_buffer.CmdVkFillBuffer(
+                edram_buffer_, 0,
+                VkDeviceSize(xenos::kEdramSizeBytes) * draw_resolution_scale_x() *
+                    draw_resolution_scale_y(),
+                UINT32_MAX);
+            static uint32_t debug_resolve_test_pattern_logged = 0;
+            if (debug_resolve_test_pattern_logged < 16) {
+              std::fprintf(stderr,
+                           "[rexglue-vulkan] debug filled EDRAM before resolve #%u "
+                           "format=%u is_64=%u dest=%08X+%X scaled=%u\n",
+                           debug_resolve_test_pattern_logged, resolve_info.color_edram_info.format,
+                           resolve_info.color_edram_info.format_is_64bpp,
+                           resolve_info.copy_dest_extent_start,
+                           resolve_info.copy_dest_extent_length, draw_resolution_scaled ? 1u : 0u);
+              std::fflush(stderr);
+              ++debug_resolve_test_pattern_logged;
+            }
+          }
+          static uint32_t pgr3_resolve_state_log_count = 0;
+          if (pgr3_resolve_state_log_count < 128) {
+            const auto rb_copy_control = register_file().Get<reg::RB_COPY_CONTROL>();
+            const auto rb_color_mask = register_file().Get<reg::RB_COLOR_MASK>();
+            const auto rb_color_info0 =
+                register_file().Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+            const auto rb_color_info1 =
+                register_file().Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]);
+            const auto rb_color_info2 =
+                register_file().Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]);
+            const auto rb_color_info3 =
+                register_file().Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[3]);
+            std::fprintf(
+                stderr,
+                "[rexglue-vulkan] resolve-state #%u rb_copy=%08X copy_src=%u copy_cmd=%u "
+                "color_clear=%u depth_clear=%u rb_color_mask=%04X rt_info=%08X/%08X/%08X/%08X "
+                "selected_format=%u selected_base=%u dest=%08X+%X scaled=%u shader=%u\n",
+                pgr3_resolve_state_log_count, rb_copy_control.value,
+                uint32_t(rb_copy_control.copy_src_select), uint32_t(rb_copy_control.copy_command),
+                rb_copy_control.color_clear_enable, rb_copy_control.depth_clear_enable,
+                rb_color_mask.value, rb_color_info0.value, rb_color_info1.value,
+                rb_color_info2.value, rb_color_info3.value, resolve_info.color_edram_info.format,
+                resolve_info.color_original_base, resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length, draw_resolution_scaled ? 1u : 0u,
+                uint32_t(copy_shader));
+            std::fflush(stderr);
+            ++pgr3_resolve_state_log_count;
           }
           UseEdramBuffer(EdramBufferUsage::kComputeRead);
           command_processor_.BindExternalComputePipeline(
@@ -1596,6 +1711,24 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           copied = true;
         }
       }
+    } else {
+      static uint32_t unknown_resolve_shader_log_count = 0;
+      if (unknown_resolve_shader_log_count < 64) {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache::Resolve unknown copy shader #{} dest_base={:08X} "
+          "dest_extent={:08X}+{:X} scaled={}",
+          unknown_resolve_shader_log_count, resolve_info.copy_dest_base,
+          resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+          draw_resolution_scaled);
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] Resolve unknown copy shader #%u dest_base=%08X "
+                   "dest_extent=%08X+%X scaled=%u\n",
+                   unknown_resolve_shader_log_count, resolve_info.copy_dest_base,
+                   resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+                   draw_resolution_scaled ? 1u : 0u);
+      std::fflush(stderr);
+      ++unknown_resolve_shader_log_count;
+    }
     }
   } else {
     copied = true;
@@ -1677,6 +1810,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     cleared = true;
   }
 
+  if (!(copied && cleared)) {
+    static uint32_t resolve_false_log_count = 0;
+    if (resolve_false_log_count < 64) {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache::Resolve returning false #{} copied={} cleared={} "
+          "copy_dest_base={:08X} copy_dest_extent={:08X}+{:X} clear_depth={} clear_color={}",
+          resolve_false_log_count, copied, cleared, resolve_info.copy_dest_base,
+          resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length, clear_depth,
+          clear_color);
+      ++resolve_false_log_count;
+    }
+  }
   return copied && cleared;
 }
 
@@ -4657,11 +4802,7 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   input_assembly_state.pNext = nullptr;
   input_assembly_state.flags = 0;
   input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-#if REX_PLATFORM_MAC
-  input_assembly_state.primitiveRestartEnable = VK_TRUE;
-#else
   input_assembly_state.primitiveRestartEnable = VK_FALSE;
-#endif
 
   // Dynamic, to stay within maxViewportDimensions while preferring a
   // power-of-two factor for converting from pixel coordinates to NDC for exact

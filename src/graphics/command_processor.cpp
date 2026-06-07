@@ -264,10 +264,19 @@ void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ra
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  bool call_now = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+      call_now = true;
+    } else {
+      pending_fns_.push(std::move(fn));
+    }
+  }
+  if (call_now) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
+    write_ptr_index_event_->Set();
   }
 }
 
@@ -310,14 +319,23 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
+    while (true) {
+      std::function<void()> fn;
+      {
+        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+        if (pending_fns_.empty()) {
+          break;
+        }
+        fn = std::move(pending_fns_.front());
+        pending_fns_.pop();
+      }
+      if (fn) {
+        fn();
+      }
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
-    if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+    if (write_ptr_index == 0xBAADF00D || read_ptr_index_.load() == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
@@ -335,24 +353,47 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+        bool has_pending_fns = false;
+        {
+          std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+          has_pending_fns = !pending_fns_.empty();
+        }
+        if (has_pending_fns) {
+          break;
+        }
+      } while (worker_running_ &&
+               (write_ptr_index == 0xBAADF00D || read_ptr_index_.load() == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      bool has_pending_fns = false;
+      {
+        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+        has_pending_fns = !pending_fns_.empty();
+      }
+      if (!worker_running_ || has_pending_fns) {
         continue;
       }
     }
-    assert_true(read_ptr_index_ != write_ptr_index);
+    assert_true(read_ptr_index_.load() != write_ptr_index);
 
-    // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    gpu_busy_ = true;
+    uint32_t new_read_index = ExecutePrimaryBuffer(read_ptr_index_.load(), write_ptr_index);
+    if (new_read_index == read_ptr_index_.load()) {
+      rex::thread::MaybeYield();
+    }
+    read_ptr_index_ = new_read_index;
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+                                       read_ptr_index_.load());
     }
+
+    bool deferred_interrupt_pending = TakeDeferredInterruptPending();
+    if (graphics_system_ && deferred_interrupt_pending) {
+      graphics_system_->DispatchInterruptCallback(1, 2);
+    }
+    gpu_busy_ = false;
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
@@ -390,7 +431,7 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
 
   stream->Write<uint32_t>(primary_buffer_ptr_);
   stream->Write<uint32_t>(primary_buffer_size_);
-  stream->Write<uint32_t>(read_ptr_index_);
+  stream->Write<uint32_t>(read_ptr_index_.load());
   stream->Write<uint32_t>(read_ptr_update_freq_);
   stream->Write<uint32_t>(read_ptr_writeback_ptr_);
   stream->Write<uint32_t>(write_ptr_index_.load());
@@ -403,7 +444,7 @@ bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
   primary_buffer_size_ = stream->Read<uint32_t>();
-  read_ptr_index_ = stream->Read<uint32_t>();
+  read_ptr_index_.store(stream->Read<uint32_t>());
   read_ptr_update_freq_ = stream->Read<uint32_t>();
   read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
   write_ptr_index_.store(stream->Read<uint32_t>());
@@ -418,9 +459,11 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-  read_ptr_index_ = 0;
+  read_ptr_index_.store(0);
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  REXSYS_WARN("InitializeRingBuffer ptr={:08X} size_log2={} size={:08X}", ptr, size_log2,
+              primary_buffer_size_);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -434,8 +477,50 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  static uint32_t write_pointer_log_count = 0;
+  if (write_pointer_log_count < 64) {
+    REXSYS_WARN("UpdateWritePointer #{} raw={:08X} read={:08X} primary_size={:08X}",
+                write_pointer_log_count, value, read_ptr_index_.load(), primary_buffer_size_);
+    ++write_pointer_log_count;
+  }
+  seen_write_pointer_ = true;
   write_ptr_index_ = value;
   write_ptr_index_event_->Set();
+}
+
+void CommandProcessor::SetPendingSwapFrontbuffer(uint32_t frontbuffer_ptr,
+                                                 uint32_t frontbuffer_width,
+                                                 uint32_t frontbuffer_height) {
+  std::lock_guard<std::mutex> lock(pending_swap_frontbuffer_mutex_);
+  pending_swap_frontbuffer_ptr_ = frontbuffer_ptr;
+  pending_swap_frontbuffer_width_ = frontbuffer_width;
+  pending_swap_frontbuffer_height_ = frontbuffer_height;
+  ++pending_swap_frontbuffer_generation_;
+}
+
+bool CommandProcessor::ConsumePendingSwapFrontbufferForResolve(uint32_t resolved_ptr,
+                                                               uint32_t resolved_length,
+                                                               uint32_t& frontbuffer_width,
+                                                               uint32_t& frontbuffer_height) {
+  std::lock_guard<std::mutex> lock(pending_swap_frontbuffer_mutex_);
+  if (!pending_swap_frontbuffer_ptr_ ||
+      pending_swap_frontbuffer_generation_ == consumed_swap_frontbuffer_generation_) {
+    return false;
+  }
+  if (pending_swap_frontbuffer_ptr_ != resolved_ptr || !pending_swap_frontbuffer_width_ ||
+      !pending_swap_frontbuffer_height_) {
+    return false;
+  }
+  const uint64_t required_length =
+      uint64_t(pending_swap_frontbuffer_width_) * pending_swap_frontbuffer_height_ *
+      sizeof(uint32_t);
+  if (resolved_length < required_length) {
+    return false;
+  }
+  frontbuffer_width = pending_swap_frontbuffer_width_;
+  frontbuffer_height = pending_swap_frontbuffer_height_;
+  consumed_swap_frontbuffer_generation_ = pending_swap_frontbuffer_generation_;
+  return true;
 }
 
 uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
@@ -724,6 +809,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   SCOPE_profile_cpu_f("gpu");
   PROFILE_SCOPE_COUNTER(kCpuPrimaryBufferUs);
 
+  if (read_index == write_index) {
+    return read_index;
+  }
+
   // If we have a pending trace stream open it now. That way we ensure we get
   // all commands.
   if (!trace_writer_.is_open() && trace_state_ == TraceState::kStreaming) {
@@ -747,8 +836,14 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  retry_command_stream_packet_ = false;
   do {
     if (!ExecutePacket(&reader)) {
+      if (retry_command_stream_packet_) {
+        retry_command_stream_packet_ = false;
+        trace_writer_.WritePrimaryBufferEnd();
+        return uint32_t(reader.read_offset() / sizeof(uint32_t));
+      }
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
@@ -763,7 +858,29 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
-void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+bool CommandProcessor::HandleIncompletePacket(memory::RingBuffer* reader, const char* reason) {
+  auto read_offset = reader->read_offset();
+  auto rewind_offset =
+      read_offset ? read_offset - sizeof(uint32_t) : reader->capacity() - sizeof(uint32_t);
+  reader->set_read_offset(rewind_offset);
+  retry_command_stream_packet_ = true;
+  static uint32_t incomplete_packet_log_count = 0;
+  if (incomplete_packet_log_count < 64) {
+    const uint32_t packet =
+        memory::load_and_swap<uint32_t>(reader->buffer() + reader->read_offset());
+    const uint32_t packet_count = ((packet >> 16) & 0x3FFF) + 1;
+    const uint32_t packet_type = packet >> 30;
+    REXGPU_INFO("Retrying command stream on incomplete {} packet #{} at read_offset={:08X} "
+                "write_offset={:08X} capacity={:08X} remaining={:08X} packet={:08X} "
+                "type={} count={}",
+                reason, incomplete_packet_log_count, reader->read_offset(), reader->write_offset(),
+                reader->capacity(), reader->read_count(), packet, packet_type, packet_count);
+    ++incomplete_packet_log_count;
+  }
+  return true;
+}
+
+bool CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
   PROFILE_SCOPE_COUNTER(kCpuIndirectBufferUs);
 
@@ -772,8 +889,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
+  retry_command_stream_packet_ = false;
   do {
     if (!ExecutePacket(&reader)) {
+      if (retry_command_stream_packet_) {
+        return false;
+      }
       // Return up a level if we encounter a bad packet.
       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
       assert_always();
@@ -782,19 +903,25 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 
   trace_writer_.WriteIndirectBufferEnd();
+  return true;
 }
 
-void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+bool CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
+  retry_command_stream_packet_ = false;
   do {
     if (!ExecutePacket(&reader)) {
+      if (retry_command_stream_packet_) {
+        return false;
+      }
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
       assert_always();
       break;
     }
   } while (reader.read_count());
+  return true;
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
@@ -808,6 +935,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
 
   if (packet == 0xCDCDCDCD) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  }
+  if (packet == 0x0BADF00D) {
+    return true;
   }
 
   switch (packet_type) {
@@ -831,16 +961,15 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   // (base_index << 2).
 
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+  uint32_t base_index = (packet & 0x7FFF);
+  uint32_t write_one_reg = (packet >> 15) & 0x1;
   if (reader->read_count() < count * sizeof(uint32_t)) {
-    REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
-                 reader->read_count(), count * sizeof(uint32_t));
+    HandleIncompletePacket(reader, "type-0");
     return false;
   }
 
   trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1 + count);
 
-  uint32_t base_index = (packet & 0x7FFF);
-  uint32_t write_one_reg = (packet >> 15) & 0x1;
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -880,8 +1009,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   auto data_start_offset = reader->read_offset();
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
-    REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
-                 reader->read_count(), count * sizeof(uint32_t));
+    HandleIncompletePacket(reader, "type-3");
     return false;
   }
 
@@ -1130,7 +1258,42 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  static uint32_t xe_swap_log_count = 0;
+  if (xe_swap_log_count < 128) {
+    const uint32_t* frontbuffer_sample =
+        memory_->TranslatePhysical<const uint32_t*>(frontbuffer_ptr);
+    const uint32_t sample_dwords = frontbuffer_width * frontbuffer_height;
+    uint32_t nonzero = 0;
+    uint32_t first_nonzero_offset = UINT32_MAX;
+    uint32_t first_nonzero_value = 0;
+    uint32_t xor_checksum = 0;
+    if (frontbuffer_sample != nullptr) {
+      for (uint32_t i = 0; i < sample_dwords; ++i) {
+        uint32_t value = frontbuffer_sample[i];
+        xor_checksum ^= value;
+        if (value != 0 && first_nonzero_offset == UINT32_MAX) {
+          first_nonzero_offset = i * sizeof(uint32_t);
+          first_nonzero_value = value;
+        }
+        nonzero += uint32_t(value != 0);
+      }
+    }
+    REXSYS_WARN(
+        "PM4_XE_SWAP #{} ptr={:08X} {}x{} count={} fb_nonzero={} fb_first_off={} "
+        "fb_first={:08X} fb_xor={:08X}",
+        xe_swap_log_count, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, count, nonzero,
+        first_nonzero_offset == UINT32_MAX ? -1 : int32_t(first_nonzero_offset),
+        first_nonzero_value, xor_checksum);
+    ++xe_swap_log_count;
+  }
+
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  static uint32_t xe_swap_return_log_count = 0;
+  if (xe_swap_return_log_count < 16) {
+    REXSYS_WARN("PM4_XE_SWAP returned #{} ptr={:08X} {}x{}", xe_swap_return_log_count,
+                frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    ++xe_swap_return_log_count;
+  }
 
   ++counter_;
   return true;
@@ -1139,11 +1302,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
+  auto payload_start_offset = reader->read_offset();
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+  if (!ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length)) {
+    if (retry_command_stream_packet_) {
+      auto rewind_offset = payload_start_offset
+                               ? payload_start_offset - sizeof(uint32_t)
+                               : reader->capacity() - sizeof(uint32_t);
+      reader->set_read_offset(rewind_offset);
+    }
+    return false;
+  }
   return true;
 }
 
@@ -1160,6 +1332,23 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+
+  // TODO: This diverges from mac-080/XeniOS, which poll memory waits normally.
+  // PGR3 currently blocks before audio/GPU startup without this compatibility
+  // hack. The wait-probe runs show the title repeatedly waits on 0x1FC9D002 /
+  // 0x1FC9D006 for values that never appear, then swaps an all-zero frontbuffer
+  // if the wait is skipped instead of forced.
+  if (is_memory) {
+    auto addr = memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3));
+    auto endian = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
+    uint32_t value = xenos::GpuSwap(*reinterpret_cast<uint32_t*>(addr), endian);
+    if ((value & mask) != ref) {
+      REXGPU_INFO("WAIT_REG_MEM: forcing addr=0x{:08X} val=0x{:08X} -> ref=0x{:08X}",
+                  poll_reg_addr, value, ref);
+      *reinterpret_cast<uint32_t*>(addr) = xenos::GpuSwap(ref, endian);
+    }
+    return true;
+  }
 
   bool matched = false;
   do {
@@ -1558,12 +1747,47 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      static uint32_t debug_issue_draw_dispatch_log_count = 0;
+      const bool debug_issue_draw_dispatch = debug_issue_draw_dispatch_log_count < 256;
+      if (debug_issue_draw_dispatch) {
+        REXGPU_WARN(
+            "{} dispatching IssueDraw #{} backend={} this={} cp={} prim={} indices={} "
+            "source={} major_mode={} explicit_major={}",
+            opcode_name, debug_issue_draw_dispatch_log_count,
+            graphics_system_ ? graphics_system_->name() : "<none>", static_cast<const void*>(this),
+            static_cast<const void*>(graphics_system_ ? graphics_system_->command_processor()
+                                                      : nullptr),
+            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.num_indices),
+            uint32_t(vgt_draw_initiator.source_select), uint32_t(vgt_draw_initiator.major_mode),
+            uint32_t(major_mode_explicit));
+      }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      if (debug_issue_draw_dispatch) {
+        REXGPU_WARN("{} IssueDraw returned #{} result={}", opcode_name,
+                    debug_issue_draw_dispatch_log_count, draw_succeeded);
+        ++debug_issue_draw_dispatch_log_count;
+      }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
         auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+        auto rb_copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
+        auto rb_surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
+        auto vfetch0 = register_file_->GetVertexFetch(0);
+        static uint32_t debug_issue_draw_failure_detail_count = 0;
+        if (debug_issue_draw_failure_detail_count < 128) {
+          REXGPU_ERROR(
+              "{} draw failure detail #{} packet={:08X} count_remaining={} is_indexed={} "
+              "index_base={:08X} index_length={} copy_command={} surface_pitch={} msaa={} "
+              "vfetch0_type={} vfetch0_size={} vfetch0_addr={:08X}",
+              opcode_name, debug_issue_draw_failure_detail_count, packet, count_remaining,
+              is_indexed, index_buffer_info.guest_base, index_buffer_info.length,
+              uint32_t(rb_copy_control.copy_command), uint32_t(rb_surface_info.surface_pitch),
+              uint32_t(rb_surface_info.msaa_samples), uint32_t(vfetch0.type),
+              uint32_t(vfetch0.size), vfetch0.address << 2);
+          ++debug_issue_draw_failure_detail_count;
+        }
         REXGPU_ERROR(
             "{}({}, {}, {}): Failed in backend "
             "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",

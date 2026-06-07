@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -776,6 +777,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   if (rb_copy_control.copy_command != xenos::CopyCommand::kRaw &&
       rb_copy_control.copy_command != xenos::CopyCommand::kConvert) {
+    static uint32_t resolve_info_fail_log_count = 0;
+    if (resolve_info_fail_log_count < 128) {
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] GetResolveInfo unsupported copy_command #%u value=%u\n",
+                   resolve_info_fail_log_count, uint32_t(rb_copy_control.copy_command));
+      std::fflush(stderr);
+      ++resolve_info_fail_log_count;
+    }
     REXGPU_ERROR(
         "Unsupported resolve copy command {}. Report the game to Xenia "
         "developers",
@@ -789,6 +798,16 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
   xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
   if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
+    static uint32_t resolve_info_fetch_fail_log_count = 0;
+    if (resolve_info_fetch_fail_log_count < 128) {
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] GetResolveInfo unsupported vertex fetch #%u type=%u "
+                   "size=%u addr=%08X endian=%u\n",
+                   resolve_info_fetch_fail_log_count, uint32_t(fetch.type), uint32_t(fetch.size),
+                   fetch.address << 2, uint32_t(fetch.endian));
+      std::fflush(stderr);
+      ++resolve_info_fetch_fail_log_count;
+    }
     REXGPU_ERROR("Unsupported resolve vertex buffer format");
     assert_always();
     return false;
@@ -796,13 +815,27 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t), fetch.size * sizeof(uint32_t));
   const float* vertices_guest =
       reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+  if (!vertices_guest) {
+    static uint32_t resolve_info_fetch_memory_fail_log_count = 0;
+    if (resolve_info_fetch_memory_fail_log_count < 128) {
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] GetResolveInfo vertex fetch memory missing #%u addr=%08X "
+                   "size=%u\n",
+                   resolve_info_fetch_memory_fail_log_count, fetch.address << 2,
+                   uint32_t(fetch.size));
+      std::fflush(stderr);
+      ++resolve_info_fetch_memory_fail_log_count;
+    }
+    return false;
+  }
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
   int32_t vertices_fixed[6];
+  float vertices_swapped[6];
   for (size_t i = 0; i < rex::countof(vertices_fixed); ++i) {
-    vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(xenos::GpuSwap(vertices_guest[i], fetch.endian) +
-                                                  half_pixel_offset);
+    vertices_swapped[i] = xenos::GpuSwap(vertices_guest[i], fetch.endian);
+    vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(vertices_swapped[i] + half_pixel_offset);
   }
   // Inclusive.
   int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
@@ -855,6 +888,16 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   if (rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
+    static uint32_t resolve_info_msaa_fail_log_count = 0;
+    if (resolve_info_msaa_fail_log_count < 128) {
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] GetResolveInfo unsupported msaa #%u msaa=%u "
+                   "surface_pitch=%u\n",
+                   resolve_info_msaa_fail_log_count, uint32_t(rb_surface_info.msaa_samples),
+                   uint32_t(rb_surface_info.surface_pitch));
+      std::fflush(stderr);
+      ++resolve_info_msaa_fail_log_count;
+    }
     // Safety check because a lot of code assumes up to 4x.
     assert_always();
     REXGPU_ERROR(
@@ -885,8 +928,64 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   assert_true(x0 < x1 && y0 < y1);
   if (x0 >= x1 || y0 >= y1) {
+    const bool zero_resolve_vertices =
+        std::abs(vertices_swapped[0]) < 0.000001f &&
+        std::abs(vertices_swapped[1]) < 0.000001f &&
+        std::abs(vertices_swapped[2]) < 0.000001f &&
+        std::abs(vertices_swapped[3]) < 0.000001f &&
+        std::abs(vertices_swapped[4]) < 0.000001f &&
+        std::abs(vertices_swapped[5]) < 0.000001f &&
+        vertices_fixed[0] == vertices_fixed[2] && vertices_fixed[0] == vertices_fixed[4] &&
+        vertices_fixed[1] == vertices_fixed[3] && vertices_fixed[1] == vertices_fixed[5];
+    if (zero_resolve_vertices && scissor.extent[0] && scissor.extent[1]) {
+      const int32_t fallback_surface_pitch_aligned =
+          int32_t(rb_surface_info.surface_pitch & ~uint32_t(xenos::kResolveAlignmentPixels - 1));
+      x0 = int32_t(scissor.offset[0]) & ~int32_t(xenos::kResolveAlignmentPixels - 1);
+      y0 = int32_t(scissor.offset[1]) & ~int32_t(xenos::kResolveAlignmentPixels - 1);
+      x1 = rex::align(std::min(int32_t(scissor.offset[0] + scissor.extent[0]),
+                               fallback_surface_pitch_aligned),
+                      int32_t(xenos::kResolveAlignmentPixels));
+      y1 = rex::align(int32_t(scissor.offset[1] + scissor.extent[1]),
+                      int32_t(xenos::kResolveAlignmentPixels));
+      if (x1 - x0 > int32_t(xenos::kMaxResolveSize)) {
+        x1 = x0 + int32_t(xenos::kMaxResolveSize);
+      }
+      if (y1 - y0 > int32_t(xenos::kMaxResolveSize)) {
+        y1 = y0 + int32_t(xenos::kMaxResolveSize);
+      }
+      static uint32_t resolve_info_zero_vertices_fallback_log_count = 0;
+      if (resolve_info_zero_vertices_fallback_log_count < 32) {
+        std::fprintf(stderr,
+                     "[rexglue-vulkan] GetResolveInfo zero-vertex fallback #%u "
+                     "fetch_addr=%08X fallback=%d,%d %dx%d scissor=%u,%u %ux%u "
+                     "surface_pitch=%u\n",
+                     resolve_info_zero_vertices_fallback_log_count, fetch.address << 2, x0, y0,
+                     x1 - x0, y1 - y0, scissor.offset[0], scissor.offset[1],
+                     scissor.extent[0], scissor.extent[1], uint32_t(rb_surface_info.surface_pitch));
+        std::fflush(stderr);
+        ++resolve_info_zero_vertices_fallback_log_count;
+      }
+    }
+  }
+  if (x0 >= x1 || y0 >= y1) {
+    static uint32_t resolve_info_empty_fail_log_count = 0;
+    if (resolve_info_empty_fail_log_count < 128) {
+      std::fprintf(
+          stderr,
+          "[rexglue-vulkan] GetResolveInfo empty region #%u x0=%d y0=%d x1=%d y1=%d "
+          "scissor=%u,%u %ux%u surface_pitch=%u fetch_addr=%08X half_pixel=%f "
+          "raw_v=%f,%f %f,%f %f,%f fixed=%d,%d %d,%d %d,%d\n",
+          resolve_info_empty_fail_log_count, x0, y0, x1, y1, scissor.offset[0],
+          scissor.offset[1], scissor.extent[0], scissor.extent[1],
+          uint32_t(rb_surface_info.surface_pitch), fetch.address << 2, half_pixel_offset,
+          vertices_swapped[0], vertices_swapped[1], vertices_swapped[2], vertices_swapped[3],
+          vertices_swapped[4], vertices_swapped[5], vertices_fixed[0], vertices_fixed[1],
+          vertices_fixed[2], vertices_fixed[3], vertices_fixed[4], vertices_fixed[5]);
+      std::fflush(stderr);
+      ++resolve_info_empty_fail_log_count;
+    }
     REXGPU_ERROR("Resolve region is empty");
-    return false;
+    return true;
   }
 
   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;

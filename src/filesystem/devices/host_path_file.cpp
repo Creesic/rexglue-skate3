@@ -85,7 +85,12 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     return X_STATUS_ACCESS_DENIED;
   }
 
-  if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+  size_t bytes_read = 0;
+  size_t* bytes_read_out = out_bytes_read ? out_bytes_read : &bytes_read;
+  if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), bytes_read_out)) {
+    if (!buffer.empty() && *bytes_read_out == 0) {
+      return X_STATUS_END_OF_FILE;
+    }
     if (entry_ && LooksLikeTeamProfileBackgroundPath(entry_->absolute_path()) &&
         ConsumeTeamProfileBackgroundLogBudget()) {
       REXFS_WARN(

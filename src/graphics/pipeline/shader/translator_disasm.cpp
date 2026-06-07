@@ -51,6 +51,9 @@ void DisassembleResultOperand(const InstructionResult& result, string::StringBuf
     case InstructionStorageTarget::kDepth:
       out->Append("oDepth");
       break;
+    case InstructionStorageTarget::kStencilReference:
+      out->Append("oStencil");
+      break;
     case InstructionStorageTarget::kNone:
       break;
   }

@@ -33,6 +33,7 @@ REXCVAR_DECLARE(bool, scaled_resolve_texture_loads_from_shared_memory);
 REXCVAR_DECLARE(int32_t, scaled_resolve_texture_loads_from_shared_memory_max_pixels);
 REXCVAR_DECLARE(bool, scaled_resolve_texture_loads_update_guest_memory);
 REXCVAR_DECLARE(int32_t, scaled_resolve_small_texture_readback_max_length);
+REXCVAR_DECLARE(bool, vulkan_debug_swap_ignore_scaled_resolve);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, readback_memexport);

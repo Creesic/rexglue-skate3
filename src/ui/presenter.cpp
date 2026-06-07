@@ -13,7 +13,10 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <utility>
+
+#include <SDL3/SDL_surface.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -47,6 +50,9 @@ REXCVAR_DEFINE_INT32(presenter_strict_guest_output_backpressure_timeout_ms, 100,
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
+REXCVAR_DEFINE_STRING(present_capture_path_once, "", "UI/Presenter",
+                      "Write one guest-output PNG while the title is running, then disable itself")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(present_safe_area_x, 100, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
@@ -103,6 +109,56 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+
+void SaveGuestOutputPngOnce(rex::ui::Presenter& presenter) {
+  static std::atomic_bool capture_done = false;
+  if (capture_done.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  std::string capture_path_string = rex::cvar::Query<std::string>("present_capture_path_once");
+  if (capture_path_string.empty()) {
+    return;
+  }
+
+  rex::ui::RawImage raw_image;
+  if (!presenter.CaptureGuestOutput(raw_image)) {
+    REXLOG_INFO("Guest output capture skipped: CaptureGuestOutput returned false");
+    return;
+  }
+
+  const std::filesystem::path capture_path = capture_path_string;
+  const std::filesystem::path capture_parent = capture_path.parent_path();
+  if (!capture_parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(capture_parent, ec);
+    if (ec) {
+      REXLOG_WARN("Failed to create capture directory {}: {}", capture_parent.string(), ec.message());
+      return;
+    }
+  }
+
+  SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(raw_image.width),
+                                               static_cast<int>(raw_image.height),
+                                               SDL_PIXELFORMAT_RGBX32, raw_image.data.data(),
+                                               static_cast<int>(raw_image.stride));
+  if (!surface) {
+    REXLOG_WARN("Failed to create SDL surface for guest output capture: {}", SDL_GetError());
+    return;
+  }
+
+  const bool write_result = SDL_SavePNG(surface, capture_path.string().c_str());
+  SDL_DestroySurface(surface);
+  if (!write_result) {
+    REXLOG_WARN("Failed to write guest output PNG to {}: {}", capture_path.string(),
+                SDL_GetError());
+    return;
+  }
+
+  capture_done.store(true, std::memory_order_relaxed);
+  rex::cvar::SetFlagByName("present_capture_path_once", "");
+  REXLOG_INFO("Captured guest output to {}", capture_path.string());
+}
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
   std::string lowered = effect_name;
@@ -576,12 +632,20 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  static std::atomic_uint32_t refresh_log_count = 0;
+  uint32_t refresh_log_index = refresh_log_count.fetch_add(1, std::memory_order_relaxed);
+  if (refresh_log_index < 16) {
+    REXLOG_INFO("RefreshGuestOutput #{} active={} frontbuffer={}x{} aspect={}x{}", refresh_log_index,
+                is_active, frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
+                display_aspect_ratio_y);
+  }
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
                                 frontbuffer_height, refresher, writable_properties.is_8bpc)) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      REXLOG_WARN("RefreshGuestOutputImpl failed for {}x{}", frontbuffer_width, frontbuffer_height);
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -630,6 +694,9 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+  if (is_active) {
+    SaveGuestOutputPngOnce(*this);
+  }
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in
   // mind.

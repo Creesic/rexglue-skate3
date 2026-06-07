@@ -65,6 +65,7 @@ if(WIN32)
     )
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
+        surface_mac.mm
         surface_sdl.cpp
         window_sdl.cpp
         windowed_app_context_sdl.cpp
@@ -145,7 +146,11 @@ if(WIN32)
         Shcore
     )
 elseif(APPLE)
-    target_link_libraries(rexui PUBLIC SDL3::SDL3)
+    target_link_libraries(rexui PUBLIC
+        SDL3::SDL3
+        "-framework Cocoa"
+        "-framework QuartzCore"
+    )
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)

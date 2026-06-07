@@ -12,7 +12,9 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
-#include <rex/ui/surface_sdl.h>
+#if REX_PLATFORM_MAC
+#include <rex/ui/surface_mac.h>
+#endif
 #include <rex/ui/virtual_key.h>
 
 #include <SDL3/SDL_hints.h>
@@ -340,11 +342,6 @@ SDLWindow::~SDLWindow() {
   if (window_) {
     WindowMap().erase(SDL_GetWindowID(window_));
   }
-  if (metal_view_) {
-    SDL_Metal_DestroyView(metal_view_);
-    metal_view_ = nullptr;
-    metal_layer_ = nullptr;
-  }
   if (window_) {
     SDL_DestroyWindow(window_);
     window_ = nullptr;
@@ -417,25 +414,6 @@ bool SDLWindow::OpenImpl() {
 
   WindowMap().emplace(SDL_GetWindowID(window_), this);
 
-  metal_view_ = SDL_Metal_CreateView(window_);
-  if (!metal_view_) {
-    REXLOG_ERROR("SDLWindow: Failed to create Metal view: {}", SDL_GetError());
-    WindowMap().erase(SDL_GetWindowID(window_));
-    SDL_DestroyWindow(window_);
-    window_ = nullptr;
-    return false;
-  }
-  metal_layer_ = SDL_Metal_GetLayer(metal_view_);
-  if (!metal_layer_) {
-    REXLOG_ERROR("SDLWindow: Failed to get Metal layer: {}", SDL_GetError());
-    SDL_Metal_DestroyView(metal_view_);
-    metal_view_ = nullptr;
-    WindowMap().erase(SDL_GetWindowID(window_));
-    SDL_DestroyWindow(window_);
-    window_ = nullptr;
-    return false;
-  }
-
   dpi_ = QueryDpi();
   SDL_ShowWindow(window_);
   if (IsMouseCaptureRequested()) {
@@ -457,11 +435,6 @@ void SDLWindow::RequestCloseImpl() {
   OnBeforeClose(destruction_receiver);
   if (!destruction_receiver.IsWindowDestroyed()) {
     RemoveCursorAutoHideTimer();
-    if (metal_view_) {
-      SDL_Metal_DestroyView(metal_view_);
-      metal_view_ = nullptr;
-      metal_layer_ = nullptr;
-    }
     if (window_) {
       WindowMap().erase(SDL_GetWindowID(window_));
       SDL_DestroyWindow(window_);
@@ -521,10 +494,12 @@ void SDLWindow::FocusImpl() {
 }
 
 std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
-  if (!(allowed_types & Surface::kTypeFlag_SDLMetalView)) {
-    return nullptr;
+#if REX_PLATFORM_MAC
+  if (allowed_types & Surface::kTypeFlag_MacNSView) {
+    return CreateMacNSViewSurface(window_);
   }
-  return std::make_unique<SDLMetalViewSurface>(window_, metal_view_, metal_layer_);
+#endif
+  return nullptr;
 }
 
 void SDLWindow::RequestPaintImpl() {

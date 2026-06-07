@@ -17,6 +17,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/video_mode_util.h>
@@ -325,6 +326,7 @@ void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
       static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
   if (!graphics_system)
     return;
+  REXKRNL_WARN("VdInitializeRingBuffer ptr={:08X} size_log2={}", ptr.guest_address(), size_log2);
   graphics_system->InitializeRingBuffer(ptr.guest_address(), size_log2);
 }
 
@@ -443,6 +445,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
   namespace xenos = rex::graphics::xenos;
 
+  static uint32_t vd_swap_log_count = 0;
+
   xenos::xe_gpu_texture_fetch_t gpu_fetch;
   memory::copy_and_swap_32_unaligned(&gpu_fetch,
                                      reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
@@ -458,6 +462,39 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert_true(*frontbuffer_ptr == frontbuffer_virtual_address);
   uint32_t frontbuffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(frontbuffer_virtual_address);
+  uint32_t buffer_physical_address = REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer_ptr.guest_address());
+  if (vd_swap_log_count < 256) {
+    const uint32_t* frontbuffer_sample =
+        REX_KERNEL_MEMORY()->TranslatePhysical<const uint32_t*>(frontbuffer_physical_address);
+    const uint32_t sample_dwords = uint32_t(*width) * uint32_t(*height);
+    uint32_t nonzero = 0;
+    uint32_t first_nonzero_offset = UINT32_MAX;
+    uint32_t first_nonzero_value = 0;
+    uint32_t xor_checksum = 0;
+    if (frontbuffer_sample != nullptr) {
+      for (uint32_t i = 0; i < sample_dwords; ++i) {
+        uint32_t value = frontbuffer_sample[i];
+        xor_checksum ^= value;
+        if (value != 0 && first_nonzero_offset == UINT32_MAX) {
+          first_nonzero_offset = i * sizeof(uint32_t);
+          first_nonzero_value = value;
+        }
+        nonzero += uint32_t(value != 0);
+      }
+    }
+    REXKRNL_INFO(
+        "VdSwap #{} buffer={:08X} buffer_pa={:08X} fetch={:08X} fb_va={:08X} fb_arg={:08X} "
+        "fb_pa={:08X} format={} color_space={} size={}x{} fetch_size={}x{} fb_nonzero={} "
+        "fb_first_off={} fb_first={:08X} fb_xor={:08X}",
+        vd_swap_log_count, buffer_ptr.guest_address(), buffer_physical_address,
+        fetch_ptr.guest_address(), frontbuffer_virtual_address, frontbuffer_ptr.value(),
+        frontbuffer_physical_address, texture_format_ptr.value(), uint32_t(*color_space_ptr),
+        uint32_t(*width), uint32_t(*height),
+        1 + gpu_fetch.size_2d.width, 1 + gpu_fetch.size_2d.height, nonzero,
+        first_nonzero_offset == UINT32_MAX ? -1 : int32_t(first_nonzero_offset),
+        first_nonzero_value, xor_checksum);
+    ++vd_swap_log_count;
+  }
   assert_true(frontbuffer_physical_address != UINT32_MAX);
   if (frontbuffer_physical_address == UINT32_MAX) {
     // Xenia-specific safety check.
@@ -485,16 +522,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   uint32_t offset = 0;
   auto dwords = buffer_ptr.as_array<uint32_t>();
 
-  // Write in the GPU texture fetch.
-  dwords[offset++] =
-      xenos::MakePacketType0(rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
-  dwords[offset++] = gpu_fetch.dword_0;
-  dwords[offset++] = gpu_fetch.dword_1;
-  dwords[offset++] = gpu_fetch.dword_2;
-  dwords[offset++] = gpu_fetch.dword_3;
-  dwords[offset++] = gpu_fetch.dword_4;
-  dwords[offset++] = gpu_fetch.dword_5;
-
+  // PM4_XE_SWAP carries the frontbuffer address directly. Do not write the
+  // synthetic texture fetch into fetch slot 0, as later draws may use that
+  // overlapping register as vertex fetch 0.
   dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
@@ -505,6 +535,151 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
+  }
+
+  // Some generated titles call VdSwap with a standalone system command buffer
+  // but never kick a primary ring write pointer for that buffer. PGR3 appends
+  // real PM4 work before each VdSwap packet, so submit the newly-written span
+  // instead of only the synthesized swap packet.
+  auto* graphics_system =
+      static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
+  graphics::CommandProcessor* command_processor =
+      graphics_system ? graphics_system->command_processor() : nullptr;
+  if (command_processor && frontbuffer_physical_address != UINT32_MAX) {
+    command_processor->SetPendingSwapFrontbuffer(frontbuffer_physical_address, uint32_t(*width),
+                                                 uint32_t(*height));
+  }
+  static uint32_t vd_swap_bridge_state_log_count = 0;
+  if (vd_swap_bridge_state_log_count < 16) {
+    const bool in_primary_ring =
+        command_processor &&
+        command_processor->IsPhysicalRangeInPrimaryRingBuffer(buffer_physical_address, 64 * 4);
+    REXKRNL_WARN(
+        "VdSwap bridge state #{} gs={} cp={} primary_ring={} seen_wptr={} in_ring={} "
+        "ring={:08X}+{:08X}",
+        vd_swap_bridge_state_log_count, graphics_system != nullptr,
+        command_processor != nullptr,
+        command_processor ? command_processor->has_primary_ring_buffer() : false,
+        command_processor ? command_processor->has_seen_write_pointer() : false, in_primary_ring,
+        command_processor ? command_processor->primary_ring_buffer_ptr() : 0,
+        command_processor ? command_processor->primary_ring_buffer_size() : 0);
+    ++vd_swap_bridge_state_log_count;
+  }
+  if (command_processor && buffer_physical_address != UINT32_MAX) {
+    const bool packet_in_primary_ring =
+        command_processor->IsPhysicalRangeInPrimaryRingBuffer(buffer_physical_address, 64 * 4);
+    static uint32_t last_system_command_buffer_end_physical = UINT32_MAX;
+    static uint32_t vd_swap_immediate_log_count = 0;
+    auto count_valid_pm4_prefix_dwords = [](uint32_t start_physical,
+                                            uint32_t max_dwords) -> uint32_t {
+      if (!max_dwords) {
+        return 0;
+      }
+      const uint32_t* raw_dwords =
+          REX_KERNEL_MEMORY()->TranslatePhysical<const uint32_t*>(start_physical);
+      if (!raw_dwords) {
+        return 0;
+      }
+      uint32_t offset = 0;
+      while (offset < max_dwords) {
+        const uint32_t packet = rex::byte_swap(raw_dwords[offset]);
+        uint32_t packet_dwords = 1;
+        if (packet != 0 && packet != 0x0BADF00D) {
+          switch (packet >> 30) {
+            case 0:
+              packet_dwords = 1 + ((packet >> 16) & 0x3FFF) + 1;
+              break;
+            case 1:
+              packet_dwords = 3;
+              break;
+            case 2:
+              packet_dwords = 1;
+              break;
+            case 3:
+              packet_dwords = 1 + ((packet >> 16) & 0x3FFF) + 1;
+              break;
+            default:
+              packet_dwords = max_dwords + 1;
+              break;
+          }
+        }
+        if (packet_dwords > max_dwords - offset) {
+          static uint32_t trim_log_count = 0;
+          if (trim_log_count < 32) {
+            REXKRNL_WARN(
+                "VdSwap standalone PM4 trim #{} span_pa={:08X} valid_dwords={} "
+                "max_dwords={} packet_pa={:08X} packet={:08X} packet_dwords={}",
+                trim_log_count, start_physical, offset, max_dwords,
+                start_physical + offset * sizeof(uint32_t), packet, packet_dwords);
+            ++trim_log_count;
+          }
+          break;
+        }
+        offset += packet_dwords;
+      }
+      return offset;
+    };
+
+    constexpr uint32_t kVdSwapPacketDwords = 64;
+    constexpr uint32_t kMaxStandaloneSubmitBytes = 4 * 1024 * 1024;
+    const uint32_t current_packet_end_physical =
+        buffer_physical_address + kVdSwapPacketDwords * sizeof(uint32_t);
+
+    if (packet_in_primary_ring) {
+      last_system_command_buffer_end_physical = UINT32_MAX;
+    } else if (current_packet_end_physical > buffer_physical_address) {
+      uint32_t submit_start_physical = buffer_physical_address;
+      bool reset_span = last_system_command_buffer_end_physical == UINT32_MAX;
+      if (!reset_span) {
+        const uint32_t span_bytes =
+            buffer_physical_address - last_system_command_buffer_end_physical;
+        if (buffer_physical_address >= last_system_command_buffer_end_physical &&
+            span_bytes <= kMaxStandaloneSubmitBytes) {
+          submit_start_physical = last_system_command_buffer_end_physical;
+        } else {
+          reset_span = true;
+        }
+      }
+
+      const uint32_t prefix_bytes = buffer_physical_address - submit_start_physical;
+      const uint32_t prefix_dword_limit = prefix_bytes / sizeof(uint32_t);
+      const uint32_t prefix_dword_count =
+          count_valid_pm4_prefix_dwords(submit_start_physical, prefix_dword_limit);
+      const uint32_t submit_bytes = prefix_dword_count * sizeof(uint32_t);
+      if (prefix_dword_count != 0 && submit_bytes <= kMaxStandaloneSubmitBytes) {
+        if (vd_swap_immediate_log_count < 32) {
+          REXKRNL_WARN(
+              "VdSwap queued submit #{} span_pa={:08X} dwords={} limit={} current_packet={:08X} "
+              "fb_pa={:08X} size={}x{} reset={}",
+              vd_swap_immediate_log_count, submit_start_physical, prefix_dword_count,
+              prefix_dword_limit,
+              buffer_physical_address, frontbuffer_physical_address, uint32_t(*width),
+              uint32_t(*height), reset_span);
+          ++vd_swap_immediate_log_count;
+        }
+        rex::thread::Fence submit_fence;
+        command_processor->CallInThread(
+            [command_processor, submit_start_physical, prefix_dword_count, &submit_fence]() {
+              command_processor->ExecutePacket(submit_start_physical, prefix_dword_count);
+              submit_fence.Signal();
+            });
+        submit_fence.Wait();
+      } else if (prefix_dword_limit != 0 && vd_swap_immediate_log_count < 32) {
+        REXKRNL_WARN(
+            "VdSwap skipped standalone PM4 prefix span_pa={:08X} limit={} current_packet={:08X}",
+            submit_start_physical, prefix_dword_limit, buffer_physical_address);
+        ++vd_swap_immediate_log_count;
+      }
+
+      rex::thread::Fence swap_fence;
+      command_processor->CallInThread(
+          [command_processor, buffer_physical_address, &swap_fence]() {
+            command_processor->ExecutePacket(buffer_physical_address, kVdSwapPacketDwords);
+            swap_fence.Signal();
+          });
+      swap_fence.Wait();
+      last_system_command_buffer_end_physical = current_packet_end_physical;
+    }
   }
 }
 

@@ -128,6 +128,17 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_inert_no_pixel_draws, false, "GPU/Vulkan",
                     "occlusion side effects")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_debug_swap_test_pattern, 0, "GPU/Vulkan",
+                     "Inject a swap-path test pattern: 0 off, 1 direct guest-output clear, "
+                     "2 write solid white guest frontbuffer memory before normal swap upload")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_debug_disable_depth_stencil, false, "GPU/Vulkan",
+                    "Disable Vulkan guest draw depth/stencil tests for render debugging")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -2455,16 +2466,69 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
-  if (!graphics_system_)
+  static uint32_t issue_swap_log_count = 0;
+  if (issue_swap_log_count < 32) {
+    std::fprintf(stderr, "[rexglue-vulkan] IssueSwap entry #%u ptr=%08X %ux%u frame=%llu\n",
+                 issue_swap_log_count, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+                 static_cast<unsigned long long>(frame_current_));
+    std::fflush(stderr);
+  }
+  auto log_issue_swap = [&](const char* stage) {
+    if (issue_swap_log_count < 32) {
+      REXSYS_WARN("Vulkan IssueSwap #{} {} ptr={:08X} {}x{}", issue_swap_log_count, stage,
+                  frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+      ++issue_swap_log_count;
+    }
+  };
+  log_issue_swap("enter");
+
+  static uint32_t swap_frontbuffer_sample_log_count = 0;
+  if (swap_frontbuffer_sample_log_count < 16) {
+    uint32_t bytes_per_pixel = 4;
+    uint32_t sample_width = frontbuffer_width;
+    uint32_t sample_height = frontbuffer_height;
+    uint32_t sample_dwords = sample_width * sample_height * bytes_per_pixel / sizeof(uint32_t);
+    const uint32_t* sample =
+        memory_->TranslatePhysical<const uint32_t*>(frontbuffer_ptr & ~uint32_t(0x3));
+    uint32_t nonzero = 0;
+    uint32_t first_nonzero_offset = UINT32_MAX;
+    uint32_t first_nonzero_value = 0;
+    uint32_t xor_checksum = 0;
+    if (sample && sample_dwords) {
+      for (uint32_t i = 0; i < sample_dwords; ++i) {
+        uint32_t value = sample[i];
+        xor_checksum ^= value;
+        if (value && first_nonzero_offset == UINT32_MAX) {
+          first_nonzero_offset = i * sizeof(uint32_t);
+          first_nonzero_value = value;
+        }
+        nonzero += uint32_t(value != 0);
+      }
+    }
+    REXSYS_WARN(
+        "Vulkan swap frontbuffer sample #{} ptr={:08X} sample={}x{} dwords={} "
+        "nonzero={} first_nonzero_off={} first_nonzero={:08X} xor={:08X}",
+        swap_frontbuffer_sample_log_count, frontbuffer_ptr, sample_width, sample_height,
+        sample_dwords, nonzero,
+        first_nonzero_offset == UINT32_MAX ? -1 : int32_t(first_nonzero_offset),
+        first_nonzero_value, xor_checksum);
+    ++swap_frontbuffer_sample_log_count;
+  }
+
+  if (!graphics_system_) {
+    log_issue_swap("no graphics_system");
     return;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
+    log_issue_swap("no presenter");
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
     return;
   }
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
+    log_issue_swap("BeginSubmission failed");
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
@@ -2544,6 +2608,28 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
 
   SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
+  int32_t swap_test_pattern = REXCVAR_GET(vulkan_debug_swap_test_pattern);
+
+  if (swap_test_pattern == 2) {
+    uint32_t* frontbuffer =
+        memory_->TranslatePhysical<uint32_t*>(frontbuffer_ptr & ~uint32_t(0x3));
+    if (frontbuffer) {
+	      uint32_t width = frontbuffer_width ? frontbuffer_width : 1280;
+	      uint32_t height = frontbuffer_height ? frontbuffer_height : 720;
+	      uint32_t fill_bytes = width * height * uint32_t(sizeof(*frontbuffer));
+	      std::fill_n(frontbuffer, size_t(width) * height, UINT32_MAX);
+	      shared_memory_->MemoryInvalidationCallback(frontbuffer_ptr & ~uint32_t(0x3), fill_bytes,
+	                                                 true);
+	      static bool swap_frontbuffer_pattern_logged = false;
+	      if (!swap_frontbuffer_pattern_logged) {
+	        swap_frontbuffer_pattern_logged = true;
+	        REXGPU_WARN(
+	            "Vulkan debug swap test pattern mode 2 wrote solid white to frontbuffer {:08X} "
+	            "{}x{} before RequestSwapTexture and invalidated shared memory",
+	            frontbuffer_ptr, width, height);
+	      }
+	    }
+	  }
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
@@ -2552,9 +2638,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+      frontbuffer_ptr, frontbuffer_width, frontbuffer_height, frontbuffer_width_scaled,
+      frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    log_issue_swap("swap_texture null");
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
   }
@@ -2650,7 +2738,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect,
+       swap_post_effect, swap_test_pattern,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -2664,6 +2752,46 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
         const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
         const VkDevice device = vulkan_device->device();
+        VkImageSubresourceRange guest_output_subresource_range =
+            ui::vulkan::util::InitializeSubresourceRange();
+
+        if (swap_test_pattern == 1) {
+          PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+                                 vulkan_context.image_ever_written_previously()
+                                     ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                                     : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 vulkan_context.image_ever_written_previously()
+                                     ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
+                                     : 0,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+          SubmitBarriers(true);
+          VkClearColorValue clear_color = {};
+          clear_color.float32[0] = 1.0f;
+          clear_color.float32[1] = 0.25f;
+          clear_color.float32[2] = 0.0f;
+          clear_color.float32[3] = 1.0f;
+          deferred_command_buffer_.CmdVkClearColorImage(
+              vulkan_context.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, 1,
+              &guest_output_subresource_range);
+          PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+          EndSubmission(true);
+          static bool swap_direct_pattern_logged = false;
+          if (!swap_direct_pattern_logged) {
+            swap_direct_pattern_logged = true;
+            REXGPU_WARN(
+                "Vulkan debug swap test pattern mode 1 cleared guest output image directly");
+          }
+          context.SetIs8bpc(true);
+          return true;
+        }
 
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
@@ -2751,6 +2879,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+        static uint32_t swap_gamma_path_log_count = 0;
+        if (swap_gamma_path_log_count < 16) {
+          REXGPU_INFO(
+              "Vulkan swap gamma path #{} compute={} fxaa={} pwl={} rb_swap_needed={} "
+              "imageViewFormatSwizzle={} output={}x{}",
+              swap_gamma_path_log_count, use_compute_gamma, use_fxaa, use_pwl_gamma_ramp,
+              swap_source_needs_rb_swap, vulkan_device->properties().imageViewFormatSwizzle,
+              guest_output_width, guest_output_height);
+          ++swap_gamma_path_log_count;
+        }
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
@@ -2841,8 +2979,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         swap_descriptor_source_write.pTexelBufferView = nullptr;
         dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_source_write, 0, nullptr);
 
-        VkImageSubresourceRange guest_output_subresource_range =
-            ui::vulkan::util::InitializeSubresourceRange();
         if (use_compute_gamma) {
           // Transition the destination image for compute writes. Contents are
           // fully overwritten, so old layout can always be UNDEFINED.
@@ -3841,8 +3977,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (debug_log_frame) {
     ++debug_frame_draws_;
   }
+  static uint32_t debug_issue_draw_entry_log_count = 0;
+  const bool debug_issue_draw_probe = debug_issue_draw_entry_log_count < 32;
+  if (debug_issue_draw_probe) {
+    const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    REXSYS_WARN(
+        "Vulkan IssueDraw entry #{} prim_type={} index_count={} source_select={} major_mode={} "
+        "explicit_major={} path_select={} tess_mode={} edram_mode={}",
+        debug_issue_draw_entry_log_count, uint32_t(prim_type), index_count,
+        uint32_t(vgt_draw_initiator.source_select), uint32_t(vgt_draw_initiator.major_mode),
+        uint32_t(major_mode_explicit), uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
+        uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
+        uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
+    ++debug_issue_draw_entry_log_count;
+  }
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    std::fprintf(stderr,
+                 "[rexglue-vulkan] IssueDraw failed stage=%s prim_type=%u index_count=%u "
+                 "source_select=%u major_mode=%u explicit_major=%u path_select=%u "
+                 "tess_mode=%u edram_mode=%u\n",
+                 stage, uint32_t(prim_type), index_count,
+                 uint32_t(vgt_draw_initiator.source_select),
+                 uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+                 uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
+                 uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
+                 uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
+    std::fflush(stderr);
     REXGPU_ERROR(
         "Vulkan IssueDraw failed at {} "
         "(prim_type={}, index_count={}, source_select={}, major_mode={}, explicit_major={}, "
@@ -3857,6 +4018,35 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
+    static uint32_t issue_draw_copy_branch_log_count = 0;
+    if (issue_draw_copy_branch_log_count < 128) {
+      const auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto vfetch0 = regs.GetVertexFetch(0);
+      REXGPU_ERROR(
+          "Vulkan IssueDraw copy branch #{} prim_type={} index_count={} source_select={} "
+          "major_mode={} explicit_major={} copy_command={} surface_pitch={} msaa={} "
+          "vfetch0_type={} vfetch0_size={} vfetch0_addr={:08X}",
+          issue_draw_copy_branch_log_count, uint32_t(prim_type), index_count,
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select),
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().major_mode), uint32_t(major_mode_explicit),
+          uint32_t(rb_copy_control.copy_command), uint32_t(rb_surface_info.surface_pitch),
+          uint32_t(rb_surface_info.msaa_samples), uint32_t(vfetch0.type), uint32_t(vfetch0.size),
+          vfetch0.address << 2);
+      std::fprintf(
+          stderr,
+          "[rexglue-vulkan] IssueDraw copy branch #%u prim_type=%u index_count=%u "
+          "source_select=%u major_mode=%u explicit_major=%u copy_command=%u surface_pitch=%u "
+          "msaa=%u vfetch0_type=%u vfetch0_size=%u vfetch0_addr=%08X\n",
+          issue_draw_copy_branch_log_count, uint32_t(prim_type), index_count,
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select),
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().major_mode),
+          uint32_t(major_mode_explicit), uint32_t(rb_copy_control.copy_command),
+          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+          uint32_t(vfetch0.type), uint32_t(vfetch0.size), vfetch0.address << 2);
+      std::fflush(stderr);
+      ++issue_draw_copy_branch_log_count;
+    }
     // Special copy handling.
     if (debug_log_frame) {
       ++debug_frame_copy_resolves_;
@@ -3880,7 +4070,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         BeginGpuTimestampedDraw(rex::perf::DrawBucket::kCopyResolve);
     bool copy_result = IssueCopy();
     EndGpuTimestampedDraw(gpu_timestamp_start);
-    return copy_result;
+    if (!copy_result) {
+      return draw_fail("copy_issue_copy");
+    }
+    return true;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -3902,7 +4095,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       REXGPU_ERROR(
           "Vertex shader memexport draw encountered without "
           "vertexPipelineStoresAndAtomics support");
-      return false;
+      return draw_fail("vertex_memexport_no_atomics");
     }
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
   }
@@ -3948,11 +4141,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       REXGPU_ERROR(
           "Pixel shader memexport draw encountered without "
           "fragmentStoresAndAtomics support");
-      return false;
+      return draw_fail("pixel_memexport_no_atomics");
     }
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  const reg::RB_DEPTHCONTROL original_normalized_depth_control = normalized_depth_control;
+  if (REXCVAR_GET(vulkan_debug_disable_depth_stencil)) {
+    normalized_depth_control.stencil_enable = 0;
+    normalized_depth_control.z_enable = 0;
+    normalized_depth_control.z_write_enable = 0;
+  }
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -4000,7 +4199,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           "PrimitiveProcessor returned triangle fan for Vulkan draw; expected "
           "triangle list conversion for D3D12 parity");
       assert_always();
-      return false;
+      return draw_fail("triangle_fan");
     }
     // Tessellation and rectangle expansion variants for rasterization are
     // produced by the primitive processor and are handled by the Vulkan
@@ -4013,7 +4212,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         !Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type)) {
       REXGPU_ERROR("Unsupported Vulkan host vertex shader type {}",
                    uint32_t(host_vertex_shader_type));
-      return false;
+      return draw_fail("unsupported_host_vertex_shader_type");
     }
 
     // Shader modifications.
@@ -4122,6 +4321,56 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  if (normalized_color_mask || normalized_depth_control.z_enable ||
+      normalized_depth_control.stencil_enable) {
+    static uint32_t debug_pgr3_draw_stderr_count = 0;
+    if (debug_pgr3_draw_stderr_count < 192) {
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto rb_color_mask = regs.Get<reg::RB_COLOR_MASK>();
+      const auto rb_color_info0 =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      const auto rb_color_info1 =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]);
+      const auto rb_color_info2 =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]);
+      const auto rb_color_info3 =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[3]);
+      const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+      const auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
+      const auto sq_context_misc = regs.Get<reg::SQ_CONTEXT_MISC>();
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] draw-state #%u frame=%llu prim=%u indices=%u host_vertices=%u "
+                   "raster=%u used_textures=%08X vs=%016llX ps=%016llX ps_color=%X "
+                   "ps_depth=%u ps_stencil=%u ps_kill=%u norm_color_mask=%X rb_color_mask=%04X "
+                   "interp_mask=%X ps_param_gen=%d sq_program=%08X sq_misc=%08X "
+                   "rt_info=%08X/%08X/%08X/%08X color0_base=%u color0_format=%u depth_enable=%u "
+                   "stencil_enable=%u depth_info=%08X depth_base=%u depth_format=%u "
+                   "surface_pitch=%u edram_mode=%u\n",
+                   debug_pgr3_draw_stderr_count,
+                   static_cast<unsigned long long>(frame_current_), uint32_t(prim_type),
+                   index_count, primitive_processing_result.host_draw_vertex_count,
+                   is_rasterization_done ? 1u : 0u, used_texture_mask,
+                   static_cast<unsigned long long>(vertex_shader->ucode_data_hash()),
+                   static_cast<unsigned long long>(pixel_shader != nullptr
+                                                       ? pixel_shader->ucode_data_hash()
+                                                       : 0),
+                   pixel_shader != nullptr ? pixel_shader->writes_color_targets() : 0,
+                   pixel_shader != nullptr && pixel_shader->writes_depth() ? 1u : 0u,
+                   pixel_shader != nullptr && pixel_shader->writes_stencil_reference() ? 1u : 0u,
+                   pixel_shader != nullptr && pixel_shader->kills_pixels() ? 1u : 0u,
+                   normalized_color_mask, rb_color_mask.value & 0xFFFF, interpolator_mask,
+                   ps_param_gen_pos == UINT32_MAX ? -1 : int32_t(ps_param_gen_pos),
+                   sq_program_cntl.value, sq_context_misc.value, rb_color_info0.value,
+                   rb_color_info1.value, rb_color_info2.value, rb_color_info3.value,
+                   rb_color_info0.color_base, uint32_t(rb_color_info0.color_format),
+                   normalized_depth_control.z_enable ? 1u : 0u,
+                   normalized_depth_control.stencil_enable ? 1u : 0u, rb_depth_info.value,
+                   rb_depth_info.depth_base, uint32_t(rb_depth_info.depth_format),
+                   rb_surface_info.surface_pitch, uint32_t(edram_mode));
+      std::fflush(stderr);
+      ++debug_pgr3_draw_stderr_count;
+    }
+  }
   uint32_t debug_team_profile_bg_fetch_index = UINT32_MAX;
   bool debug_team_profile_bg_signed_view = false;
   uint32_t debug_team_profile_bg_texture_base = 0;
@@ -4262,6 +4511,67 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
   }
 
+  if (debug_log_frame &&
+      (normalized_color_mask || normalized_depth_control.z_enable ||
+       normalized_depth_control.stencil_enable)) {
+    static uint32_t debug_draw_state_log_count = 0;
+    if (debug_draw_state_log_count < 96) {
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto rb_color_mask = regs.Get<reg::RB_COLOR_MASK>();
+      const auto rb_color_info0 =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      const auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+      const auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      REXGPU_WARN(
+          "Vulkan debug draw state #{}: frame={}, prim={}, index_count={}, host_vertices={}, "
+          "raster={}, used_mask={:08X}, vs={:016X}, ps={:016X}, "
+          "ps_color={:X}, ps_depth={}, ps_stencil={}, ps_kill={}, "
+          "norm_color_mask={:X}, rb_color_mask={:04X}, color0_info={:08X}, "
+          "color0_base={}, color0_format={}, depth_control={:08X}, "
+          "orig_depth_control={:08X}, depth_info={:08X}, depth_base={}, "
+          "depth_format={}, surface_pitch={}, edram_mode={}, "
+          "viewport={}x{}+{},{} z={}..{}, scissor={}..{},{}..{}, "
+          "vk_scissor={}..{},{}..{}",
+          debug_draw_state_log_count, frame_current_, uint32_t(prim_type), index_count,
+          primitive_processing_result.host_draw_vertex_count, is_rasterization_done,
+          used_texture_mask, vertex_shader->ucode_data_hash(),
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0,
+          pixel_shader != nullptr ? pixel_shader->writes_color_targets() : 0,
+          pixel_shader != nullptr && pixel_shader->writes_depth(),
+          pixel_shader != nullptr && pixel_shader->writes_stencil_reference(),
+          pixel_shader != nullptr && pixel_shader->kills_pixels(), normalized_color_mask,
+          rb_color_mask.value & 0xFFFF, rb_color_info0.value, rb_color_info0.color_base,
+          uint32_t(rb_color_info0.color_format), normalized_depth_control.value,
+          original_normalized_depth_control.value, rb_depth_info.value, rb_depth_info.depth_base,
+          uint32_t(rb_depth_info.depth_format), rb_surface_info.surface_pitch, uint32_t(edram_mode),
+          viewport_info.xy_extent[0], viewport_info.xy_extent[1], viewport_info.xy_offset[0],
+          viewport_info.xy_offset[1], viewport_info.z_min, viewport_info.z_max,
+          pa_sc_window_scissor_tl.tl_x, pa_sc_window_scissor_tl.tl_y,
+          pa_sc_window_scissor_br.br_x, pa_sc_window_scissor_br.br_y, dynamic_scissor_.offset.x,
+          dynamic_scissor_.offset.y, dynamic_scissor_.offset.x + int32_t(dynamic_scissor_.extent.width),
+          dynamic_scissor_.offset.y + int32_t(dynamic_scissor_.extent.height));
+      ++debug_draw_state_log_count;
+    }
+  }
+
+  if (normalized_color_mask || normalized_depth_control.z_enable ||
+      normalized_depth_control.stencil_enable) {
+    static uint32_t debug_pgr3_draw_hash_log_count = 0;
+    if (debug_pgr3_draw_hash_log_count < 24) {
+      REXSYS_WARN(
+          "PGR3 debug draw hash #{}: prim={}, index_count={}, host_vertices={}, "
+          "raster={}, vs={:016X}, ps={:016X}, ps_color={:X}, color_mask={:X}, "
+          "depth={}, stencil={}",
+          debug_pgr3_draw_hash_log_count, uint32_t(prim_type), index_count,
+          primitive_processing_result.host_draw_vertex_count, is_rasterization_done,
+          vertex_shader->ucode_data_hash(), pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0,
+          pixel_shader != nullptr ? pixel_shader->writes_color_targets() : 0, normalized_color_mask,
+          bool(normalized_depth_control.z_enable), bool(normalized_depth_control.stencil_enable));
+      ++debug_pgr3_draw_hash_log_count;
+    }
+  }
+
   if (debug_team_profile_bg_draw) {
     int32_t remaining = REXCVAR_GET(vulkan_debug_log_team_profile_background_draws_remaining);
     if (remaining > 0) {
@@ -4341,53 +4651,195 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Ensure vertex buffers are resident.
   {
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageVertexBuffersUs);
-    const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
-    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
-      uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
-      uint32_t j;
-      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
-        vfetch_bits_remaining &= ~(uint32_t(1) << j);
-        uint32_t vfetch_index = i * 32 + j;
-        uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-        if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-          continue;
-        }
-        xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-        switch (vfetch_constant.type) {
-          case xenos::FetchConstantType::kVertex:
-            break;
-          case xenos::FetchConstantType::kInvalidVertex:
-            if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
-              break;
+    auto ensure_vertex_fetch_buffers_resident =
+        [&](const Shader::ConstantRegisterMap& constant_map, const char* shader_stage) -> bool {
+      for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+          vfetch_bits_remaining &= ~(uint32_t(1) << j);
+          uint32_t vfetch_index = i * 32 + j;
+          uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+          const bool debug_pgr3_vertex_vfetch =
+              shader_stage[0] == 'v' &&
+              (vertex_shader->ucode_data_hash() == UINT64_C(0x6DD9DD041F740550) ||
+               vertex_shader->ucode_data_hash() == UINT64_C(0x063CF827A1F9FAF0));
+          if (debug_pgr3_vertex_vfetch) {
+            static uint32_t debug_pgr3_vs_vfetch_log_count = 0;
+            if (debug_pgr3_vs_vfetch_log_count < 128) {
+              const uint32_t vfetch_address = vfetch_constant.address << 2;
+              const uint32_t vfetch_size = vfetch_constant.size << 2;
+              const uint8_t* data = shared_memory_->DebugTranslatePhysical(vfetch_address);
+              const uint32_t sample_length = std::min(vfetch_size, UINT32_C(112));
+              uint32_t nonzero_count = 0;
+              uint32_t words[16] = {};
+              if (data != nullptr && sample_length != 0) {
+                for (uint32_t sample_index = 0; sample_index < sample_length; ++sample_index) {
+                  nonzero_count += uint32_t(data[sample_index] != 0);
+                }
+                std::memcpy(words, data, std::min<size_t>(sizeof(words), sample_length));
+              }
+              std::fprintf(
+                  stderr,
+                  "[rexglue-vulkan] PGR3 VS vfetch #%u shader=%016llX vf=%u dword0=%08X "
+                  "dword1=%08X addr=%08X size=%X endian=%u sample_len=%u nonzero=%u "
+                  "words=%08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                  debug_pgr3_vs_vfetch_log_count,
+                  static_cast<unsigned long long>(vertex_shader->ucode_data_hash()), vfetch_index,
+                  vfetch_constant.dword_0, vfetch_constant.dword_1, vfetch_address, vfetch_size,
+                  uint32_t(vfetch_constant.endian), sample_length, nonzero_count, words[0], words[1],
+                  words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9],
+                  words[10], words[11]);
+              std::fflush(stderr);
+              ++debug_pgr3_vs_vfetch_log_count;
             }
-            REXGPU_WARN(
-                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
-                "This "
-                "is incorrect behavior, but you can try bypassing this by "
-                "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
-                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          }
+          if (pixel_shader != nullptr && shader_stage[0] == 'p' && vfetch_index == 95 &&
+              pixel_shader->ucode_data_hash() == UINT64_C(0x6AE1AEA35BF4FF68)) {
+            static uint32_t debug_pgr3_ps_vfetch_log_count = 0;
+            if (debug_pgr3_ps_vfetch_log_count < 16) {
+              const uint32_t vfetch_address = vfetch_constant.address << 2;
+              const uint32_t vfetch_size = vfetch_constant.size << 2;
+              const uint8_t* data = shared_memory_->DebugTranslatePhysical(vfetch_address);
+              const uint32_t sample_length = std::min(vfetch_size, UINT32_C(64));
+              uint32_t nonzero_count = 0;
+              uint8_t head[32] = {};
+              if (data != nullptr && sample_length != 0) {
+                for (uint32_t sample_index = 0; sample_index < sample_length; ++sample_index) {
+                  nonzero_count += uint32_t(data[sample_index] != 0);
+                }
+                std::memcpy(head, data, std::min<size_t>(sizeof(head), sample_length));
+              }
+              std::fprintf(
+                  stderr,
+                  "[rexglue-vulkan] PGR3 PS vfetch #%u vf=%u dword0=%08X dword1=%08X "
+                  "addr=%08X size=%X sample_len=%u nonzero=%u head="
+                  "%02X%02X%02X%02X %02X%02X%02X%02X "
+                  "%02X%02X%02X%02X %02X%02X%02X%02X "
+                  "%02X%02X%02X%02X %02X%02X%02X%02X "
+                  "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                  debug_pgr3_ps_vfetch_log_count, vfetch_index, vfetch_constant.dword_0,
+                  vfetch_constant.dword_1, vfetch_address, vfetch_size, sample_length,
+                  nonzero_count, head[0], head[1], head[2], head[3], head[4], head[5],
+                  head[6], head[7], head[8], head[9], head[10], head[11], head[12],
+                  head[13], head[14], head[15], head[16], head[17], head[18], head[19],
+                  head[20], head[21], head[22], head[23], head[24], head[25], head[26],
+                  head[27], head[28], head[29], head[30], head[31]);
+              std::fflush(stderr);
+              ++debug_pgr3_ps_vfetch_log_count;
+            }
+          }
+          if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+            continue;
+          }
+          switch (vfetch_constant.type) {
+            case xenos::FetchConstantType::kVertex:
+              break;
+            case xenos::FetchConstantType::kInvalidVertex:
+              if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+                break;
+              }
+              REXGPU_WARN(
+                  "{} shader vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
+                  "This is incorrect behavior, but you can try bypassing this by launching Xenia "
+                  "with --gpu_allow_invalid_fetch_constants=true.",
+                  shader_stage, vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+              REXGPU_ERROR("Vulkan IssueDraw failed at {}_shader_invalid_vfetch index={}",
+                           shader_stage, vfetch_index);
+              std::fprintf(stderr,
+                           "[rexglue-vulkan] %s shader invalid vfetch index=%u dword0=%08X "
+                           "dword1=%08X\n",
+                           shader_stage, vfetch_index, vfetch_constant.dword_0,
+                           vfetch_constant.dword_1);
+              std::fflush(stderr);
+              return false;
+            default:
+              REXGPU_WARN(
+                  "{} shader vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
+                  shader_stage, vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+              REXGPU_ERROR("Vulkan IssueDraw failed at {}_shader_bad_vfetch index={}",
+                           shader_stage, vfetch_index);
+              std::fprintf(stderr,
+                           "[rexglue-vulkan] %s shader bad vfetch index=%u dword0=%08X "
+                           "dword1=%08X type=%u\n",
+                           shader_stage, vfetch_index, vfetch_constant.dword_0,
+                           vfetch_constant.dword_1, uint32_t(vfetch_constant.type));
+              std::fflush(stderr);
+              return false;
+          }
+          VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+          if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+            vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+            continue;
+          }
+          const uint32_t vfetch_address = vfetch_constant.address << 2;
+          const uint32_t vfetch_size = vfetch_constant.size << 2;
+          if (!shared_memory_->RequestRange(vfetch_address, vfetch_size)) {
+            REXGPU_ERROR(
+                "Failed to request {} shader vertex buffer at 0x{:08X} (size {}) in the shared "
+                "memory",
+                shader_stage, vfetch_address, vfetch_size);
+            REXGPU_ERROR("Vulkan IssueDraw failed at {}_shader_vfetch_request_range index={}",
+                         shader_stage, vfetch_index);
+            std::fprintf(stderr,
+                         "[rexglue-vulkan] %s shader vfetch request failed index=%u "
+                         "addr=%08X size=%08X dword0=%08X dword1=%08X\n",
+                         shader_stage, vfetch_index, vfetch_address, vfetch_size,
+                         vfetch_constant.dword_0, vfetch_constant.dword_1);
+            std::fflush(stderr);
             return false;
-          default:
-            REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
-                        vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-            return false;
-        }
-        VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-        if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+          }
+          if (debug_log_frame) {
+            static uint32_t debug_vfetch_residency_log_count = 0;
+            if (debug_vfetch_residency_log_count < 64) {
+              const uint8_t* data = shared_memory_->DebugTranslatePhysical(vfetch_address);
+              const uint32_t sample_length = std::min(vfetch_size, UINT32_C(256));
+              uint32_t nonzero_count = 0;
+              uint8_t head[8] = {};
+              if (data != nullptr && sample_length != 0) {
+                for (uint32_t sample_index = 0; sample_index < sample_length; ++sample_index) {
+                  nonzero_count += uint32_t(data[sample_index] != 0);
+                }
+                std::memcpy(head, data, std::min<size_t>(sizeof(head), sample_length));
+              }
+              REXGPU_WARN(
+                  "Vulkan debug vfetch residency #{}: shader={}, index={}, address={:08X}, "
+                  "size={:X}, sample_len={}, nonzero={}, head={:02X}{:02X}{:02X}{:02X}"
+                  "{:02X}{:02X}{:02X}{:02X}",
+                  debug_vfetch_residency_log_count, shader_stage, vfetch_index, vfetch_address,
+                  vfetch_size, sample_length, nonzero_count, head[0], head[1], head[2], head[3],
+                  head[4], head[5], head[6], head[7]);
+              ++debug_vfetch_residency_log_count;
+            }
+          }
+          state.address = vfetch_constant.address;
+          state.size = vfetch_constant.size;
           vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-          continue;
         }
-        if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
-          REXGPU_ERROR(
-              "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
-              "memory",
-              vfetch_constant.address << 2, vfetch_constant.size << 2);
-          return false;
-        }
-        state.address = vfetch_constant.address;
-        state.size = vfetch_constant.size;
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
       }
+      return true;
+    };
+    if (!ensure_vertex_fetch_buffers_resident(vertex_shader->constant_register_map(), "vertex")) {
+      return draw_fail("vertex_shader_vfetch_residency");
+    }
+    if (pixel_shader != nullptr &&
+        pixel_shader->ucode_data_hash() == UINT64_C(0x6AE1AEA35BF4FF68)) {
+      static uint32_t debug_pgr3_ps_constant_map_log_count = 0;
+      if (debug_pgr3_ps_constant_map_log_count < 16) {
+        const Shader::ConstantRegisterMap& constant_map = pixel_shader->constant_register_map();
+        REXSYS_WARN(
+            "PGR3 debug PS constant map #{}: vf_bitmap={:08X}:{:08X}:{:08X}, "
+            "float_count={}, reg_static_bound={}",
+            debug_pgr3_ps_constant_map_log_count, constant_map.vertex_fetch_bitmap[0],
+            constant_map.vertex_fetch_bitmap[1], constant_map.vertex_fetch_bitmap[2],
+            constant_map.float_count, pixel_shader->register_static_address_bound());
+        ++debug_pgr3_ps_constant_map_log_count;
+      }
+    }
+    if (pixel_shader && !ensure_vertex_fetch_buffers_resident(pixel_shader->constant_register_map(),
+                                                              "pixel")) {
+      return draw_fail("pixel_shader_vfetch_residency");
     }
 
     // Synchronize the memory pages backing memory scatter export streams, and
@@ -4400,7 +4852,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             "Failed to request memexport stream at 0x{:08X} (size {}) in the "
             "shared memory",
             memexport_range_base_bytes, memexport_range.size_bytes);
-        return false;
+        return draw_fail("memexport_stream_residency");
       }
       memexport_extent_start = std::min(memexport_extent_start, memexport_range_base_bytes);
       memexport_extent_end =
@@ -4411,7 +4863,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         REXGPU_ERROR(
             "Failed to request full shared memory residency for unresolved "
             "memexport destinations");
-        return false;
+        return draw_fail("memexport_full_shared_memory_residency");
       }
     }
 
@@ -4611,6 +5063,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  if (debug_issue_draw_probe) {
+    REXSYS_WARN("Vulkan IssueDraw success prim_type={} index_count={}", uint32_t(prim_type),
+                index_count);
+  }
   return true;
 }
 
@@ -4817,6 +5273,13 @@ bool VulkanCommandProcessor::IssueCopy() {
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   if (!BeginSubmission(true)) {
+    static uint32_t issue_copy_begin_submission_fail_log_count = 0;
+    if (issue_copy_begin_submission_fail_log_count < 64) {
+      REXGPU_ERROR("Vulkan IssueCopy failed at begin_submission #{} frame={} submission_completed={}",
+                   issue_copy_begin_submission_fail_log_count, frame_current_,
+                   submission_completed_);
+      ++issue_copy_begin_submission_fail_log_count;
+    }
     return false;
   }
 
@@ -4824,6 +5287,18 @@ bool VulkanCommandProcessor::IssueCopy() {
       ResolveAutoReadbackMode(GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)),
                               kernel_state_);
   const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
+  static uint32_t issue_copy_mode_log_count = 0;
+  if (issue_copy_mode_log_count < 128) {
+    std::fprintf(stderr,
+                 "[rexglue-vulkan] IssueCopy #%u readback_mode=%s gameplay=%u scaled=%u "
+                 "frame=%llu\n",
+                 issue_copy_mode_log_count, ReadbackResolveModeName(readback_mode),
+                 gameplay_state_active ? 1u : 0u,
+                 texture_cache_->IsDrawResolutionScaled() ? 1u : 0u,
+                 static_cast<unsigned long long>(frame_current_));
+    std::fflush(stderr);
+    ++issue_copy_mode_log_count;
+  }
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address = 0;
@@ -4831,6 +5306,34 @@ bool VulkanCommandProcessor::IssueCopy() {
     bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                                   written_address, written_length);
     const bool scaled = texture_cache_->IsDrawResolutionScaled();
+    if (!resolved) {
+      static uint32_t issue_copy_resolve_fail_log_count = 0;
+      if (issue_copy_resolve_fail_log_count < 64) {
+        const RegisterFile& regs = *register_file_;
+        const auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+        const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+        const auto vfetch0 = regs.GetVertexFetch(0);
+        REXGPU_ERROR(
+            "Vulkan IssueCopy resolve failed #{} mode={} gameplay={} scaled={} "
+            "copy_command={} surface_pitch={} msaa={} vfetch0_type={} vfetch0_size={} "
+            "vfetch0_addr={:08X}",
+            issue_copy_resolve_fail_log_count, ReadbackResolveModeName(readback_mode),
+            gameplay_state_active, scaled, uint32_t(rb_copy_control.copy_command),
+            uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+            uint32_t(vfetch0.type), uint32_t(vfetch0.size), vfetch0.address << 2);
+        std::fprintf(stderr,
+                     "[rexglue-vulkan] IssueCopy resolve failed #%u mode=%s gameplay=%u "
+                     "scaled=%u copy_command=%u surface_pitch=%u msaa=%u vfetch0_type=%u "
+                     "vfetch0_size=%u vfetch0_addr=%08X\n",
+                     issue_copy_resolve_fail_log_count, ReadbackResolveModeName(readback_mode),
+                     gameplay_state_active ? 1u : 0u, scaled ? 1u : 0u,
+                     uint32_t(rb_copy_control.copy_command), uint32_t(rb_surface_info.surface_pitch),
+                     uint32_t(rb_surface_info.msaa_samples), uint32_t(vfetch0.type),
+                     uint32_t(vfetch0.size), vfetch0.address << 2);
+        std::fflush(stderr);
+        ++issue_copy_resolve_fail_log_count;
+      }
+    }
     if (ConsumeResolveDecisionLogBudget()) {
       REXGPU_WARN(
           "Vulkan resolve diagnostic: frame={}, mode={}, path=resolve-only, result={}, "
@@ -5116,6 +5619,32 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
+    static uint32_t issue_copy_readback_resolve_fail_log_count = 0;
+    if (issue_copy_readback_resolve_fail_log_count < 64) {
+      const RegisterFile& regs = *register_file_;
+      const auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+      const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto vfetch0 = regs.GetVertexFetch(0);
+      REXGPU_ERROR(
+          "Vulkan IssueCopy readback resolve failed #{} frame={} scaled={} copy_command={} "
+          "surface_pitch={} msaa={} vfetch0_type={} vfetch0_size={} vfetch0_addr={:08X}",
+          issue_copy_readback_resolve_fail_log_count, frame_current_,
+          texture_cache_->IsDrawResolutionScaled(), uint32_t(rb_copy_control.copy_command),
+          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+          uint32_t(vfetch0.type), uint32_t(vfetch0.size), vfetch0.address << 2);
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] IssueCopy readback resolve failed #%u frame=%llu scaled=%u "
+                   "copy_command=%u surface_pitch=%u msaa=%u vfetch0_type=%u vfetch0_size=%u "
+                   "vfetch0_addr=%08X\n",
+                   issue_copy_readback_resolve_fail_log_count,
+                   static_cast<unsigned long long>(frame_current_),
+                   texture_cache_->IsDrawResolutionScaled() ? 1u : 0u,
+                   uint32_t(rb_copy_control.copy_command), uint32_t(rb_surface_info.surface_pitch),
+                   uint32_t(rb_surface_info.msaa_samples), uint32_t(vfetch0.type),
+                   uint32_t(vfetch0.size), vfetch0.address << 2);
+      std::fflush(stderr);
+      ++issue_copy_readback_resolve_fail_log_count;
+    }
     if (ConsumeResolveDecisionLogBudget()) {
       REXGPU_WARN("Vulkan resolve diagnostic: frame={}, mode=readback, path=readback, result=false",
                   frame_current_);
@@ -5154,20 +5683,28 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   bool force_scaled_resolve_sync_only = false;
   bool force_scaled_resolve_cpu_copy = false;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    constexpr uint32_t kImportSkaterPreviewResolveAddress = UINT32_C(0x04911000);
-    constexpr uint32_t kImportSkaterPreviewResolveLength = UINT32_C(0x2D0000);
-    force_scaled_resolve_cpu_copy =
-        !IsGameplayStateActive(kernel_state_) && is_scaled &&
-        written_address == kImportSkaterPreviewResolveAddress &&
-        written_length == kImportSkaterPreviewResolveLength;
+    // VdSwap presents from guest memory. When resolution scaling is active,
+    // Resolve writes to the scaled resolve buffer, so mirror scaled resolves
+    // back to guest memory even if the general readback cvar is disabled.
+    force_scaled_resolve_cpu_copy = is_scaled;
     if (!force_scaled_resolve_cpu_copy) {
       log_readback_decision("disabled-after-resolve", readback_mode);
       return true;
     }
     readback_mode = ReadbackResolveMode::kFull;
     force_scaled_resolve_sync_only = true;
-    log_readback_decision("targeted-scaled-resolve-full", readback_mode, false, true,
-                          kImportSkaterPreviewResolveLength);
+    static uint32_t scaled_guest_memory_readback_log_count = 0;
+    if (scaled_guest_memory_readback_log_count < 64) {
+      std::fprintf(stderr,
+                   "[rexglue-vulkan] forcing scaled resolve guest-memory readback #%u "
+                   "address=%08X length=%X frame=%llu\n",
+                   scaled_guest_memory_readback_log_count, written_address, written_length,
+                   static_cast<unsigned long long>(frame_current_));
+      std::fflush(stderr);
+      ++scaled_guest_memory_readback_log_count;
+    }
+    log_readback_decision("scaled-guest-memory-readback", readback_mode, false, true,
+                          written_length);
   }
 
   const int32_t max_readback_length = REXCVAR_GET(vulkan_readback_resolve_max_length);
@@ -5467,7 +6004,101 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
+      static uint32_t resolve_readback_copy_probe_count = 0;
+      const bool probe_readback_copy = resolve_readback_copy_probe_count < 128;
+      auto sample_dwords = [](const void* data, uint32_t length, uint32_t& nonzero,
+                              uint32_t& first_nonzero_offset, uint32_t& first_nonzero_value,
+                              uint32_t& xor_checksum) {
+        nonzero = 0;
+        first_nonzero_offset = UINT32_MAX;
+        first_nonzero_value = 0;
+        xor_checksum = 0;
+        const uint32_t* dwords = reinterpret_cast<const uint32_t*>(data);
+        const uint32_t dword_count = length / sizeof(uint32_t);
+        for (uint32_t i = 0; i < dword_count; ++i) {
+          uint32_t value = dwords[i];
+          xor_checksum ^= value;
+          if (value != 0 && first_nonzero_offset == UINT32_MAX) {
+            first_nonzero_offset = i * sizeof(uint32_t);
+            first_nonzero_value = value;
+          }
+          nonzero += uint32_t(value != 0);
+        }
+      };
+      if (probe_readback_copy) {
+        uint32_t src_nonzero;
+        uint32_t src_first_nonzero_offset;
+        uint32_t src_first_nonzero_value;
+        uint32_t src_xor_checksum;
+        sample_dwords(readback.mapped_data[read_index], written_length, src_nonzero,
+                      src_first_nonzero_offset, src_first_nonzero_value, src_xor_checksum);
+        std::fprintf(stderr,
+                     "[rexglue-vulkan] resolve readback pre-copy #%u addr=%08X length=%X "
+                     "scaled=%u mode=%s read_index=%u src_nonzero=%u src_first_off=%d "
+                     "src_first=%08X src_xor=%08X frame=%llu\n",
+                     resolve_readback_copy_probe_count, written_address, written_length,
+                     is_scaled ? 1u : 0u, ReadbackResolveModeName(readback_mode), read_index,
+                     src_nonzero,
+                     src_first_nonzero_offset == UINT32_MAX ? -1
+                                                            : int32_t(src_first_nonzero_offset),
+                     src_first_nonzero_value, src_xor_checksum,
+                     static_cast<unsigned long long>(frame_current_));
+        std::fflush(stderr);
+      }
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      // This memcpy bypasses guest memory access callbacks. Tell the GPU-side
+      // caches that guest RAM now contains the resolved image so VdSwap reloads
+      // the frontbuffer instead of sampling stale scaled-resolve/texture data.
+      shared_memory_->MemoryInvalidationCallback(written_address, written_length, true);
+      primitive_processor_->MemoryInvalidationCallback(written_address, written_length, true);
+      static uint32_t resolve_readback_invalidation_log_count = 0;
+      if (resolve_readback_invalidation_log_count < 64) {
+        std::fprintf(stderr,
+                     "[rexglue-vulkan] resolve readback invalidated guest-memory #%u "
+                     "addr=%08X length=%X scaled=%u frame=%llu\n",
+                     resolve_readback_invalidation_log_count, written_address, written_length,
+                     is_scaled ? 1u : 0u, static_cast<unsigned long long>(frame_current_));
+        std::fflush(stderr);
+        ++resolve_readback_invalidation_log_count;
+      }
+      if (probe_readback_copy) {
+        uint32_t dst_nonzero;
+        uint32_t dst_first_nonzero_offset;
+        uint32_t dst_first_nonzero_value;
+        uint32_t dst_xor_checksum;
+        sample_dwords(destination, written_length, dst_nonzero, dst_first_nonzero_offset,
+                      dst_first_nonzero_value, dst_xor_checksum);
+        std::fprintf(stderr,
+                     "[rexglue-vulkan] resolve readback post-copy #%u addr=%08X length=%X "
+                     "scaled=%u dst_nonzero=%u dst_first_off=%d dst_first=%08X "
+                     "dst_xor=%08X frame=%llu\n",
+                     resolve_readback_copy_probe_count, written_address, written_length,
+                     is_scaled ? 1u : 0u, dst_nonzero,
+                     dst_first_nonzero_offset == UINT32_MAX ? -1
+                                                            : int32_t(dst_first_nonzero_offset),
+                     dst_first_nonzero_value, dst_xor_checksum,
+                     static_cast<unsigned long long>(frame_current_));
+        std::fflush(stderr);
+        ++resolve_readback_copy_probe_count;
+      }
+      uint32_t pending_frontbuffer_width = 0;
+      uint32_t pending_frontbuffer_height = 0;
+      if (ConsumePendingSwapFrontbufferForResolve(written_address, written_length,
+                                                  pending_frontbuffer_width,
+                                                  pending_frontbuffer_height)) {
+        static uint32_t resolve_readback_swap_log_count = 0;
+        if (resolve_readback_swap_log_count < 64) {
+          std::fprintf(stderr,
+                       "[rexglue-vulkan] resolve readback issuing pending swap #%u "
+                       "addr=%08X length=%X size=%ux%u frame=%llu\n",
+                       resolve_readback_swap_log_count, written_address, written_length,
+                       pending_frontbuffer_width, pending_frontbuffer_height,
+                       static_cast<unsigned long long>(frame_current_));
+          std::fflush(stderr);
+          ++resolve_readback_swap_log_count;
+        }
+        IssueSwap(written_address, pending_frontbuffer_width, pending_frontbuffer_height);
+      }
       if (readback_mode == ReadbackResolveMode::kFull) {
         texture_cache_->DebugRecordResolveReadback(written_address, written_length, is_scaled);
         DebugDumpResolveReadback(written_address, written_length, is_scaled,
@@ -6269,6 +6900,14 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       rex::perf::CounterId::kCpuD3D12BeginSubmissionUs);
 
   if (device_lost_) {
+    static uint32_t begin_submission_device_lost_log_count = 0;
+    if (begin_submission_device_lost_log_count < 16) {
+      REXGPU_ERROR("Vulkan BeginSubmission failed: device lost #{} is_guest={} frame={} "
+                   "submission_completed={}",
+                   begin_submission_device_lost_log_count, is_guest_command, frame_current_,
+                   submission_completed_);
+      ++begin_submission_device_lost_log_count;
+    }
     return false;
   }
 
@@ -6289,6 +6928,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     CheckSubmissionFenceAndDeviceLoss(await_submission);
   }
   if (device_lost_ || submission_completed_ < await_submission) {
+    static uint32_t begin_submission_wait_log_count = 0;
+    if (begin_submission_wait_log_count < 64) {
+      REXGPU_ERROR(
+          "Vulkan BeginSubmission failed after fence check #{} is_guest={} opening_frame={} "
+          "device_lost={} frame={} await_submission={} submission_completed={}",
+          begin_submission_wait_log_count, is_guest_command, is_opening_frame, device_lost_,
+          frame_current_, await_submission, submission_completed_);
+      ++begin_submission_wait_log_count;
+    }
     return false;
   }
 

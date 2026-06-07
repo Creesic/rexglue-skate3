@@ -64,6 +64,8 @@ enum class InstructionStorageTarget {
   kColor,
   // X of the result is stored to the depth export (gl_FragDepth).
   kDepth,
+  // X of the result is stored to the stencil reference export.
+  kStencilReference,
 };
 
 // Must be used only in translation to skip unused components, but not in
@@ -77,6 +79,7 @@ constexpr uint32_t GetInstructionStorageTargetUsedComponentCount(InstructionStor
     case InstructionStorageTarget::kPointSizeEdgeFlagKillVertex:
       return 3;
     case InstructionStorageTarget::kDepth:
+    case InstructionStorageTarget::kStencilReference:
       return 1;
     default:
       return 4;
@@ -932,6 +935,8 @@ class Shader {
 
   // True if the shader overrides the pixel depth.
   bool writes_depth() const { return writes_depth_; }
+  // True if the shader overrides the pixel stencil reference.
+  bool writes_stencil_reference() const { return writes_stencil_reference_; }
 
   // Whether the shader can have early depth and stencil writing enabled, unless
   // alpha test or alpha to coverage is enabled.
@@ -1016,6 +1021,7 @@ class Shader {
   bool kills_pixels_ = false;
   bool uses_texture_fetch_instruction_results_ = false;
   bool writes_depth_ = false;
+  bool writes_stencil_reference_ = false;
 
   // Memory export eM write info for each control flow instruction, if there are
   // any eM writes in the shader.

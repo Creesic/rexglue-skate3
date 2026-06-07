@@ -47,6 +47,7 @@
 
 #include <fmt/format.h>
 #include <imgui.h>
+#include <SDL3/SDL_surface.h>
 #include <toml++/toml.hpp>
 
 #include <algorithm>
@@ -207,6 +208,55 @@ void StartForcedExitWatchdog(const char* reason) {
 
 REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, true, "UI/Advanced",
                     "Enable the developer cvar browser on F4");
+REXCVAR_DEFINE_STRING(capture_guest_output_on_destroy, "", "UI/Advanced",
+                      "Write the presenter's guest output to a PNG on app shutdown");
+
+namespace {
+
+void CaptureGuestOutputOnDestroy(rex::graphics::GraphicsSystem* graphics_system) {
+  const std::string capture_path_string = rex::cvar::Query<std::string>("capture_guest_output_on_destroy");
+  if (capture_path_string.empty() || !graphics_system || !graphics_system->presenter()) {
+    return;
+  }
+
+  rex::ui::RawImage raw_image;
+  if (!graphics_system->presenter()->CaptureGuestOutput(raw_image)) {
+    REXLOG_WARN("Failed to capture guest output during shutdown");
+    return;
+  }
+
+  const std::filesystem::path capture_path = capture_path_string;
+  const std::filesystem::path capture_parent = capture_path.parent_path();
+  if (!capture_parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(capture_parent, ec);
+    if (ec) {
+      REXLOG_WARN("Failed to create capture directory {}: {}", capture_parent.string(), ec.message());
+      return;
+    }
+  }
+
+  SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(raw_image.width),
+                                               static_cast<int>(raw_image.height),
+                                               SDL_PIXELFORMAT_RGBX32, raw_image.data.data(),
+                                               static_cast<int>(raw_image.stride));
+  if (!surface) {
+    REXLOG_WARN("Failed to create SDL surface for guest output capture: {}", SDL_GetError());
+    return;
+  }
+
+  const bool write_result = SDL_SavePNG(surface, capture_path.string().c_str());
+  SDL_DestroySurface(surface);
+  if (!write_result) {
+    REXLOG_WARN("Failed to encode guest output PNG to {}: {}", capture_path.string(),
+                SDL_GetError());
+    return;
+  }
+
+  REXLOG_INFO("Captured guest output to {}", capture_path.string());
+}
+
+}  // namespace
 
 // --- ReXApp ---
 
@@ -660,6 +710,10 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
+
+  auto* graphics_system =
+      runtime_ ? static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system()) : nullptr;
+  CaptureGuestOutputOnDestroy(graphics_system);
 
 #if REX_PLATFORM_MAC
   shutting_down_.store(true, std::memory_order_release);

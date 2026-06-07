@@ -1470,6 +1470,13 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
       // including specials, when the depth buffer is floating-point.
       is_clamped = true;
       break;
+    case InstructionStorageTarget::kStencilReference:
+      assert_true(used_write_mask == 0b0001);
+      assert_true(current_shader().writes_stencil_reference());
+      if (!edram_rov_used_) {
+        dest = dxbc::Dest::OStencilRef();
+      }
+      break;
   }
   if (dest.type_ == dxbc::OperandType::kNull) {
     return;
@@ -3383,6 +3390,9 @@ void DxbcShaderTranslator::WriteShaderCode() {
         } else {
           ao_.OpDclOutput(dxbc::Dest::ODepth());
         }
+      }
+      if (current_shader().writes_stencil_reference()) {
+        ao_.OpDclOutput(dxbc::Dest::OStencilRef());
       }
     }
   }

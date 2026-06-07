@@ -1,0 +1,14 @@
+[project]
+sdk_version = "0.8.2.4"
+name = "pgr3"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated"
+includes = [
+  "pgr3_config.toml",
+]
+
+setjmp_address = 0x82420d60
+longjmp_address = 0x82420c40
+

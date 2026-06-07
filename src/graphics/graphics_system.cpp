@@ -88,6 +88,11 @@ namespace rex::graphics {
 
 namespace {
 
+constexpr uint32_t kPgr3GpuInterruptCallback = 0x82377228;
+constexpr uint32_t kPgr3InterruptHandlerOffset = 10388;
+constexpr uint32_t kPgr3Source1HandlerOffset = 16;
+constexpr uint32_t kPgr3MissingInterruptHandler = 0x0BADF00D;
+
 uint64_t TicksToUsInteger(uint64_t ticks, uint64_t frequency) {
   return frequency ? ticks * 1000000ull / frequency : 0;
 }
@@ -122,6 +127,22 @@ void PreciseWaitUntilHostTick(uint64_t target_host_tick, uint64_t host_frequency
       std::atomic_signal_fence(std::memory_order_seq_cst);
     }
   }
+}
+
+bool IsPgr3Source1InterruptHandlerMissing(memory::Memory* memory, uint32_t user_data) {
+  if (!memory || !user_data) {
+    return false;
+  }
+
+  const uint32_t handler_table = memory::load_and_swap<uint32_t>(
+      memory->TranslateVirtual(user_data + kPgr3InterruptHandlerOffset));
+  if (!handler_table || handler_table == kPgr3MissingInterruptHandler) {
+    return true;
+  }
+
+  const uint32_t source1_handler = memory::load_and_swap<uint32_t>(
+      memory->TranslateVirtual(handler_table + kPgr3Source1HandlerOffset));
+  return source1_handler == kPgr3MissingInterruptHandler;
 }
 
 }  // namespace
@@ -421,6 +442,17 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
 
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
+      // Ensure guest ring writes are globally visible before the consumer thread
+      // observes the updated write pointer on weaker memory-ordering hosts.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      {
+        static uint32_t cp_wptr_log_count = 0;
+        if (cp_wptr_log_count < 64) {
+          REXGPU_INFO("GraphicsSystem CP_RB_WPTR write #{} value={:08X}", cp_wptr_log_count,
+                      value);
+          ++cp_wptr_log_count;
+        }
+      }
       command_processor_->UpdateWritePointer(value);
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
@@ -453,6 +485,21 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
     return;
   }
 
+  // PGR3 leaves the command-stream interrupt handler slot at the debug
+  // sentinel during early startup. Dispatching source 1 before the slot is
+  // populated only trips the title's CPU_INTERRUPT assert; source 0 vblank
+  // remains enough to keep initialization moving.
+  if (source == 1 && interrupt_callback_ == kPgr3GpuInterruptCallback &&
+      IsPgr3Source1InterruptHandlerMissing(memory_, interrupt_callback_data_)) {
+    static uint32_t suppressed_pgr3_source1_count = 0;
+    if (suppressed_pgr3_source1_count < 16) {
+      REXGPU_WARN("Suppressing early PGR3 source-1 GPU interrupt #{} callback={:08X} data={:08X}",
+                  suppressed_pgr3_source1_count, interrupt_callback_, interrupt_callback_data_);
+      ++suppressed_pgr3_source1_count;
+    }
+    return;
+  }
+
   auto thread = system::XThread::GetCurrentThread();
   assert_not_null(thread);
 
@@ -477,12 +524,23 @@ void GraphicsSystem::MarkVblank() {
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {
     command_processor_->increment_counter();
+    command_processor_->RequestDeferredInterrupt();
   }
 
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  if (command_processor_) {
+    bool gpu_is_busy = command_processor_->gpu_busy();
+    bool deferred_interrupt_pending = false;
+    if (!gpu_is_busy) {
+      deferred_interrupt_pending = command_processor_->TakeDeferredInterruptPending();
+    }
+    if (!gpu_is_busy && deferred_interrupt_pending) {
+      DispatchInterruptCallback(1, 2);
+    }
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

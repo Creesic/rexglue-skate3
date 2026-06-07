@@ -60,6 +60,41 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_debug_force_pixel_color, 0, "GPU/Vulkan",
+                     "Force translated Vulkan pixel shaders to output a solid debug color: "
+                     "0 off, 1 red, 2 green, 3 blue, 4 white")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_force_vfetch_color, 0, "GPU/Vulkan",
+                     "Force translated Vulkan pixel shaders to output debug vfetch data: "
+                     "0 off, 1 accumulated abs values, 2 cyan if vfetch reached")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_UINT64(
+    vulkan_debug_force_pixel_shader_hash, 0, "GPU/Vulkan",
+    "Restrict vulkan_debug_force_pixel_color and vulkan_debug_force_vfetch_color to this decimal "
+    "pixel shader ucode hash (0 = all pixel shaders)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_force_vertex_fullscreen_position, 0, "GPU/Vulkan",
+                     "Force translated Vulkan vertex shader positions: 0 off, 1 full-screen "
+                     "triangle, 2 final r0 as guest position, 3 final r0 as host position")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_UINT64(
+    vulkan_debug_force_vertex_shader_hash, 0, "GPU/Vulkan",
+    "Restrict vulkan_debug_force_vertex_fullscreen_position to this decimal vertex shader ucode "
+    "hash (0 = all vertex shaders)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -956,6 +991,30 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
       device_properties.shaderCullDistance &&
       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
 
+  const uint64_t debug_force_vertex_shader_hash = REXCVAR_GET(vulkan_debug_force_vertex_shader_hash);
+  const uint32_t debug_force_vertex_position_mode =
+      uint32_t(REXCVAR_GET(vulkan_debug_force_vertex_fullscreen_position));
+  const bool debug_force_vertex_applies =
+      debug_force_vertex_position_mode &&
+      (!debug_force_vertex_shader_hash ||
+       debug_force_vertex_shader_hash == shader.ucode_data_hash());
+  modification.vertex.debug_force_position_mode =
+      debug_force_vertex_applies ? debug_force_vertex_position_mode : 0;
+  if (modification.vertex.debug_force_position_mode) {
+    static uint32_t debug_vertex_modification_log_count = 0;
+    if (debug_vertex_modification_log_count < 32) {
+      REXGPU_WARN(
+          "Vulkan debug vertex modification #{}: shader={:016X}, modification={:016X}, "
+          "force_position_mode={}, target_hash={:016X}, interpolators={:04X}, "
+          "register_count={}",
+          debug_vertex_modification_log_count, shader.ucode_data_hash(), modification.value,
+          uint32_t(modification.vertex.debug_force_position_mode),
+          debug_force_vertex_shader_hash, uint32_t(modification.vertex.interpolator_mask),
+          shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg));
+      ++debug_vertex_modification_log_count;
+    }
+  }
+
   return modification;
 }
 
@@ -1005,6 +1064,30 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
+    }
+  }
+
+  const uint64_t debug_force_shader_hash = REXCVAR_GET(vulkan_debug_force_pixel_shader_hash);
+  const bool debug_force_applies =
+      !debug_force_shader_hash || debug_force_shader_hash == shader.ucode_data_hash();
+  modification.pixel.debug_force_color =
+      debug_force_applies ? uint32_t(REXCVAR_GET(vulkan_debug_force_pixel_color)) : 0;
+  modification.pixel.debug_force_vfetch_color =
+      debug_force_applies ? uint32_t(REXCVAR_GET(vulkan_debug_force_vfetch_color)) : 0;
+  if (modification.pixel.debug_force_color || modification.pixel.debug_force_vfetch_color) {
+    static uint32_t debug_pixel_modification_log_count = 0;
+    if (debug_pixel_modification_log_count < 32) {
+      REXGPU_WARN(
+          "Vulkan debug pixel modification #{}: shader={:016X}, modification={:016X}, "
+          "force_color={}, force_vfetch={}, target_hash={:016X}, interpolators={:04X}, "
+          "register_count={}, writes_color={:X}, writes_stencil={}",
+          debug_pixel_modification_log_count, shader.ucode_data_hash(), modification.value,
+          uint32_t(modification.pixel.debug_force_color),
+          uint32_t(modification.pixel.debug_force_vfetch_color), debug_force_shader_hash,
+          uint32_t(modification.pixel.interpolator_mask),
+          shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg),
+          shader.writes_color_targets(), shader.writes_stencil_reference());
+      ++debug_pixel_modification_log_count;
     }
   }
 

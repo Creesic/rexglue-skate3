@@ -74,8 +74,8 @@ elseif(UNIX AND NOT APPLE)
 endif()
 
 # Enforce Clang18 compiler
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
+    message(FATAL_ERROR "ReXGlue requires Clang-compatible compiler. Please set CMAKE_CXX_COMPILER to clang++")
 endif()
 
 if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
@@ -93,6 +93,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_DEBUG_POSTFIX d)
 set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
+
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING
+        "Target architectures for macOS builds." FORCE)
+endif()
 
 set(REX_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
 if(APPLE AND CMAKE_OSX_ARCHITECTURES)

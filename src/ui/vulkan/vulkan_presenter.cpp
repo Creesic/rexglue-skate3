@@ -16,9 +16,13 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <SDL3/SDL_surface.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -41,6 +45,7 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 #if REX_PLATFORM_MAC
+#include <rex/ui/surface_mac.h>
 #include <rex/ui/surface_sdl.h>
 #endif
 #if REX_PLATFORM_WIN32
@@ -67,6 +72,22 @@ REXCVAR_DEFINE_BOOL(vulkan_present_timing_log, false, "UI/Vulkan",
 REXCVAR_DEFINE_UINT32(vulkan_present_timing_interval, 120, "UI/Vulkan",
                       "Number of presented frames per Vulkan timing log entry")
     .range(1, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_BOOL(vulkan_debug_present_clear_red, false, "UI/Vulkan",
+                    "Debug only: clear swapchain images red before presentation")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_STRING(vulkan_debug_swapchain_capture_path_once, "", "UI/Vulkan",
+                      "Debug only: write one pre-present swapchain image PNG, then disable itself")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_UINT32(vulkan_debug_swapchain_capture_skip_frames, 0, "UI/Vulkan",
+                      "Debug only: skip this many presents before one-shot swapchain capture")
+    .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
@@ -126,6 +147,65 @@ void AccumulateAndMaybeLogPresentTiming(bool execute_ui_drawers, uint64_t acquir
       stats.consume_and_record_us / frames, stats.end_command_buffer_us / frames,
       stats.submit_us / frames, stats.present_us / frames);
   stats = {};
+}
+
+bool SaveRawImagePng(const RawImage& raw_image, const std::filesystem::path& path) {
+  const std::filesystem::path parent_path = path.parent_path();
+  if (!parent_path.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(parent_path, ec);
+    if (ec) {
+      REXLOG_WARN("VulkanPresenter: Failed to create swapchain capture directory {}: {}",
+                  parent_path.string(), ec.message());
+      return false;
+    }
+  }
+
+  SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(raw_image.width),
+                                               static_cast<int>(raw_image.height),
+                                               SDL_PIXELFORMAT_RGBX32,
+                                               const_cast<uint8_t*>(raw_image.data.data()),
+                                               static_cast<int>(raw_image.stride));
+  if (!surface) {
+    REXLOG_WARN("VulkanPresenter: Failed to create SDL surface for swapchain capture: {}",
+                SDL_GetError());
+    return false;
+  }
+
+  const bool write_result = SDL_SavePNG(surface, path.string().c_str());
+  SDL_DestroySurface(surface);
+  if (!write_result) {
+    REXLOG_WARN("VulkanPresenter: Failed to write swapchain capture PNG to {}: {}",
+                path.string(), SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
+bool ShouldCaptureSwapchainThisFrame(const std::string& capture_path) {
+  static std::string active_capture_path;
+  static uint32_t frames_remaining = 0;
+
+  if (capture_path.empty()) {
+    active_capture_path.clear();
+    frames_remaining = 0;
+    return false;
+  }
+
+  if (capture_path != active_capture_path) {
+    active_capture_path = capture_path;
+    frames_remaining = REXCVAR_GET(vulkan_debug_swapchain_capture_skip_frames);
+    if (frames_remaining != 0) {
+      REXLOG_INFO("VulkanPresenter: Delaying swapchain capture by {} frames", frames_remaining);
+    }
+  }
+
+  if (frames_remaining != 0) {
+    --frames_remaining;
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace
@@ -503,7 +583,7 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #endif
 #if REX_PLATFORM_MAC
   if (instance_extensions.ext_EXT_metal_surface) {
-    type_flags |= Surface::kTypeFlag_SDLMetalView;
+    type_flags |= Surface::kTypeFlag_MacNSView;
   }
 #endif
 #if REX_PLATFORM_WIN32
@@ -842,7 +922,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_supports_transfer_src, surface_unusable);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -909,6 +990,22 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       } break;
 #endif
 #if REX_PLATFORM_MAC
+      case Surface::kTypeIndex_MacNSView: {
+        auto& mac_nsview_surface = static_cast<const MacNSViewSurface&>(new_surface);
+        mac_nsview_surface.ConfigureMetalLayer(new_surface_width, new_surface_height);
+        CAMetalLayer* const metal_layer = mac_nsview_surface.GetOrCreateMetalLayer();
+        if (!metal_layer) {
+          REXLOG_ERROR("VulkanPresenter: Failed to create a CAMetalLayer for MoltenVK");
+          return SurfacePaintConnectResult::kFailureSurfaceUnusable;
+        }
+        VkMetalSurfaceCreateInfoEXT surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.pLayer = metal_layer;
+        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
       case Surface::kTypeIndex_SDLMetalView: {
         auto& sdl_metal_surface = static_cast<const SDLMetalViewSurface&>(new_surface);
         VkMetalSurfaceCreateInfoEXT surface_create_info;
@@ -935,7 +1032,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
+        paint_context_.swapchain_supports_transfer_src, surface_unusable);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1171,8 +1269,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& supports_transfer_src_out,
+    bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
+  supports_transfer_src_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1395,6 +1495,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.imageExtent = image_extent;
   swapchain_create_info.imageArrayLayers = 1;
   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  const bool supports_transfer_src =
+      (surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+  if (supports_transfer_src) {
+    swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
   uint32_t swapchain_queue_family_indices[2];
   if (queue_family_index_graphics_compute != queue_family_index_present) {
     // Using concurrent sharing mode to avoid an explicit ownership transfer
@@ -1485,6 +1590,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   image_extent_out = swapchain_create_info.imageExtent;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
                 swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  supports_transfer_src_out = supports_transfer_src;
   return swapchain;
 }
 
@@ -1505,6 +1611,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   // The old swapchain must be destroyed externally.
   VkSwapchainKHR old_swapchain = swapchain;
   swapchain = nullptr;
+  swapchain_supports_transfer_src = false;
   return old_swapchain;
 }
 
@@ -1670,7 +1777,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   VkClearAttachment swapchain_image_clear_attachment;
   swapchain_image_clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   swapchain_image_clear_attachment.colorAttachment = 0;
-  swapchain_image_clear_attachment.clearValue.color.float32[0] = 0.0f;
+  swapchain_image_clear_attachment.clearValue.color.float32[0] =
+      REXCVAR_GET(vulkan_debug_present_clear_red) ? 1.0f : 0.0f;
   swapchain_image_clear_attachment.clearValue.color.float32[1] = 0.0f;
   swapchain_image_clear_attachment.clearValue.color.float32[2] = 0.0f;
   swapchain_image_clear_attachment.clearValue.color.float32[3] = 1.0f;
@@ -1711,7 +1819,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // multiple threads can't paint the main target at the same time).
   }
 
-  if (guest_output_image) {
+  if (guest_output_image && !REXCVAR_GET(vulkan_debug_present_clear_red)) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
@@ -2223,6 +2331,79 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
+  const std::string swapchain_capture_path =
+      rex::cvar::Query<std::string>("vulkan_debug_swapchain_capture_path_once");
+  const bool swapchain_capture_requested = ShouldCaptureSwapchainThisFrame(swapchain_capture_path);
+  bool swapchain_capture_active = false;
+  VkBuffer swapchain_capture_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory swapchain_capture_memory = VK_NULL_HANDLE;
+  VkDeviceSize swapchain_capture_buffer_size = 0;
+  if (swapchain_capture_requested) {
+    if (!paint_context_.swapchain_supports_transfer_src) {
+      REXLOG_WARN(
+          "VulkanPresenter: Swapchain capture requested, but this surface does not support "
+          "VK_IMAGE_USAGE_TRANSFER_SRC_BIT");
+      rex::cvar::SetFlagByName("vulkan_debug_swapchain_capture_path_once", "");
+    } else {
+      swapchain_capture_buffer_size = VkDeviceSize(sizeof(uint32_t)) *
+                                      paint_context_.swapchain_extent.width *
+                                      paint_context_.swapchain_extent.height;
+      if (!util::CreateDedicatedAllocationBuffer(
+              vulkan_device_, swapchain_capture_buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              util::MemoryPurpose::kReadback, swapchain_capture_buffer,
+              swapchain_capture_memory)) {
+        REXLOG_WARN("VulkanPresenter: Failed to create swapchain capture readback buffer");
+        rex::cvar::SetFlagByName("vulkan_debug_swapchain_capture_path_once", "");
+      } else {
+        swapchain_capture_active = true;
+      }
+    }
+  }
+  if (swapchain_capture_active) {
+    VkImageMemoryBarrier image_memory_barrier;
+    image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    image_memory_barrier.pNext = nullptr;
+    image_memory_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    image_memory_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_memory_barrier.image = paint_context_.swapchain_images[swapchain_image_index];
+    image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
+    dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &image_memory_barrier);
+
+    VkBufferImageCopy buffer_image_copy = {};
+    buffer_image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    buffer_image_copy.imageSubresource.layerCount = 1;
+    buffer_image_copy.imageExtent.width = paint_context_.swapchain_extent.width;
+    buffer_image_copy.imageExtent.height = paint_context_.swapchain_extent.height;
+    buffer_image_copy.imageExtent.depth = 1;
+    dfn.vkCmdCopyImageToBuffer(
+        draw_command_buffer, paint_context_.swapchain_images[swapchain_image_index],
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_capture_buffer, 1, &buffer_image_copy);
+
+    VkBufferMemoryBarrier buffer_memory_barrier;
+    buffer_memory_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    buffer_memory_barrier.pNext = nullptr;
+    buffer_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buffer_memory_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    buffer_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_memory_barrier.buffer = swapchain_capture_buffer;
+    buffer_memory_barrier.offset = 0;
+    buffer_memory_barrier.size = VK_WHOLE_SIZE;
+    image_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    image_memory_barrier.dstAccessMask = 0;
+    image_memory_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                             0, nullptr, 1, &buffer_memory_barrier, 1, &image_memory_barrier);
+  }
+
   const auto timing_end_command_buffer_start = std::chrono::steady_clock::now();
   dfn.vkEndCommandBuffer(draw_command_buffer);
   const auto timing_end_command_buffer_end = std::chrono::steady_clock::now();
@@ -2284,6 +2465,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
+      if (swapchain_capture_buffer != VK_NULL_HANDLE) {
+        dfn.vkDestroyBuffer(device, swapchain_capture_buffer, nullptr);
+      }
+      if (swapchain_capture_memory != VK_NULL_HANDLE) {
+        dfn.vkFreeMemory(device, swapchain_capture_memory, nullptr);
+      }
       if (ui_setup_command_buffer_index != SIZE_MAX) {
         // If failed to submit, make the UI setup command buffer available for
         // immediate reuse, as the completed submission index won't be updated
@@ -2318,6 +2505,56 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
   const auto timing_present_end = std::chrono::steady_clock::now();
+  if (swapchain_capture_active) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index);
+    dfn.vkDestroyBuffer(device, swapchain_capture_buffer, nullptr);
+    void* mapping = nullptr;
+    if (dfn.vkMapMemory(device, swapchain_capture_memory, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+        VK_SUCCESS) {
+      REXLOG_WARN("VulkanPresenter: Failed to map swapchain capture memory");
+    } else {
+      RawImage raw_image;
+      raw_image.width = paint_context_.swapchain_extent.width;
+      raw_image.height = paint_context_.swapchain_extent.height;
+      raw_image.stride = sizeof(uint32_t) * raw_image.width;
+      raw_image.data.resize(size_t(swapchain_capture_buffer_size));
+      const uint8_t* source_bytes = reinterpret_cast<const uint8_t*>(mapping);
+      uint8_t* dest_bytes = raw_image.data.data();
+      const size_t pixel_count = size_t(raw_image.width) * raw_image.height;
+      const bool source_bgra =
+          paint_context_.swapchain_render_pass_format == VK_FORMAT_B8G8R8A8_UNORM ||
+          paint_context_.swapchain_render_pass_format == VK_FORMAT_B8G8R8A8_SRGB;
+      const bool source_rgba =
+          paint_context_.swapchain_render_pass_format == VK_FORMAT_R8G8B8A8_UNORM ||
+          paint_context_.swapchain_render_pass_format == VK_FORMAT_R8G8B8A8_SRGB;
+      if (!source_bgra && !source_rgba) {
+        REXLOG_WARN(
+            "VulkanPresenter: Swapchain capture format {} is not explicitly handled; copying "
+            "channels as RGBA",
+            uint32_t(paint_context_.swapchain_render_pass_format));
+      }
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const uint8_t* source_pixel = source_bytes + i * 4;
+        uint8_t* dest_pixel = dest_bytes + i * 4;
+        if (source_bgra) {
+          dest_pixel[0] = source_pixel[2];
+          dest_pixel[1] = source_pixel[1];
+          dest_pixel[2] = source_pixel[0];
+        } else {
+          dest_pixel[0] = source_pixel[0];
+          dest_pixel[1] = source_pixel[1];
+          dest_pixel[2] = source_pixel[2];
+        }
+        dest_pixel[3] = 0xFF;
+      }
+      if (SaveRawImagePng(raw_image, swapchain_capture_path)) {
+        REXLOG_INFO("VulkanPresenter: Captured pre-present swapchain image to {}",
+                    swapchain_capture_path);
+      }
+    }
+    dfn.vkFreeMemory(device, swapchain_capture_memory, nullptr);
+    rex::cvar::SetFlagByName("vulkan_debug_swapchain_capture_path_once", "");
+  }
   AccumulateAndMaybeLogPresentTiming(
       execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
       ElapsedUs(timing_acquire_end, timing_submit_start),

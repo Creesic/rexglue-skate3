@@ -12,6 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cctype>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -31,6 +36,47 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+namespace {
+
+std::mutex g_debug_file_paths_mutex;
+std::unordered_map<uint32_t, std::string> g_debug_file_paths;
+
+std::string LowerAscii(std::string_view value) {
+  std::string lower(value);
+  for (char& c : lower) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return lower;
+}
+
+bool IsPgr3MoviePath(std::string_view path) {
+  std::string lower = LowerAscii(path);
+  return lower.find(".bik") != std::string::npos ||
+         lower.find("movies\\") != std::string::npos ||
+         lower.find("movies/") != std::string::npos;
+}
+
+bool ShouldSkipPgr3MovieOpen() {
+  const char* value = std::getenv("REX_PGR3_SKIP_BIK");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+void RememberDebugFilePath(uint32_t handle, std::string_view path) {
+  std::lock_guard lock(g_debug_file_paths_mutex);
+  g_debug_file_paths[handle] = std::string(path);
+}
+
+std::string LookupDebugFilePath(uint32_t handle) {
+  std::lock_guard lock(g_debug_file_paths_mutex);
+  auto it = g_debug_file_paths.find(handle);
+  if (it == g_debug_file_paths.end()) {
+    return {};
+  }
+  return it->second;
+}
+
+}  // namespace
 
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
@@ -133,6 +179,17 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
+  if (IsPgr3MoviePath(target_path) && ShouldSkipPgr3MovieOpen()) {
+    constexpr X_STATUS result = X_STATUS_OBJECT_NAME_NOT_FOUND;
+    *handle_out = X_INVALID_HANDLE_VALUE;
+    if (io_status_block) {
+      io_status_block->status = result;
+      io_status_block->information = 0;
+    }
+    REXKRNL_WARN("[pgr3-file] skip movie open status={:#x} path='{}'", result, target_path);
+    return result;
+  }
+
   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       object_attrs->root_directory != 0) {
     auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
@@ -168,6 +225,16 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
 
   *handle_out = handle;
+  static uint32_t debug_open_count = 0;
+  const bool debug_movie_path = IsPgr3MoviePath(target_path);
+  if (handle != X_INVALID_HANDLE_VALUE) {
+    RememberDebugFilePath(static_cast<uint32_t>(handle), target_path);
+  }
+  if (debug_movie_path || debug_open_count < 256) {
+    REXKRNL_WARN("[pgr3-file] open #{} status={:#x} handle={:#x} path='{}'", debug_open_count,
+                 result, static_cast<uint32_t>(handle), target_path);
+  }
+  ++debug_open_count;
   if (XFAILED(result)) {
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
@@ -275,8 +342,18 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     io_status_block->information = 0;
   }
 
-  if (ev && signal_event) {
+      if (ev && signal_event) {
     ev->Set(0, false);
+  }
+
+  static uint32_t debug_movie_read_count = 0;
+  std::string debug_path = LookupDebugFilePath(static_cast<uint32_t>(file_handle));
+  if (!debug_path.empty() && IsPgr3MoviePath(debug_path) && debug_movie_read_count < 128) {
+    REXKRNL_WARN("[pgr3-file] read #{} status={:#x} handle={:#x} len={:#x} offset={} path='{}'",
+                 debug_movie_read_count, result, static_cast<uint32_t>(file_handle),
+                 static_cast<uint32_t>(buffer_length), byte_offset_ptr ? (int64_t)byte_offset : -1,
+                 debug_path);
+    ++debug_movie_read_count;
   }
 
   // Log detailed completion info for debugging async IO issues

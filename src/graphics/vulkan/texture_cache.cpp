@@ -41,8 +41,19 @@ REXCVAR_DEFINE_BOOL(vulkan_scaled_resolve_write_barrier_overlap_only, false, "GP
                     "not overlap")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_debug_swap_ignore_scaled_resolve, false, "GPU/Vulkan",
+                    "Debug only: force swap textures to load from shared guest memory instead "
+                    "of scaled-resolve memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(vulkan_debug_log_3d_as_2d_remaining, 256, "GPU/Vulkan",
                      "Log scaled 3D-as-2D texture wrapper usage")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_debug_log_texture_source_samples_remaining, 0, "GPU/Vulkan",
+                     "Log byte samples from shared-memory texture upload sources")
     .range(0, 10000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
@@ -1010,7 +1021,10 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
   return sampler_used->second.last_usage_submission;
 }
 
-VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
+VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t frontbuffer_ptr,
+                                                   uint32_t frontbuffer_width,
+                                                   uint32_t frontbuffer_height,
+                                                   uint32_t& width_scaled_out,
                                                    uint32_t& height_scaled_out,
                                                    xenos::TextureFormat& format_out,
                                                    uint32_t* width_unscaled_out,
@@ -1020,14 +1034,104 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
+  bool using_explicit_frontbuffer_key = false;
+  const bool fetch_key_valid = key.is_valid && key.base_page != 0 &&
+                               key.dimension == xenos::DataDimension::k2DOrStacked;
+  if (!fetch_key_valid && frontbuffer_ptr && frontbuffer_width && frontbuffer_height) {
+    key.MakeInvalid();
+    key.base_page = (frontbuffer_ptr & ~uint32_t(0xFFF)) >> 12;
+    key.dimension = xenos::DataDimension::k2DOrStacked;
+    key.width_minus_1 = std::min(frontbuffer_width, UINT32_C(8192)) - 1;
+    key.height_minus_1 = std::min(frontbuffer_height, UINT32_C(8192)) - 1;
+    key.tiled = 1;
+    key.packed_mips = 0;
+    key.mip_page = 0;
+    key.depth_or_array_size_minus_1 = 0;
+    key.pitch = std::max(UINT32_C(1), (frontbuffer_width + xenos::kTextureTileWidthHeight - 1) >>
+                                           xenos::kTextureTileWidthHeightLog2);
+    key.mip_max_level = 0;
+    key.format = xenos::TextureFormat::k_8_8_8_8;
+    key.endianness = xenos::Endian::kNone;
+    key.signed_separate = 0;
+    key.scaled_resolve = 0;
+    key.is_valid = 1;
+    using_explicit_frontbuffer_key = true;
+  }
+  static uint32_t swap_texture_log_count = 0;
+  auto log_swap_texture = [&](const char* stage, const TextureKey& log_key,
+                              const VulkanTexture* log_texture = nullptr,
+                              VkImageView log_view = VK_NULL_HANDLE) {
+    if (swap_texture_log_count >= 32) {
+      return;
+    }
+    const FormatInfo* format_info = log_key.is_valid ? FormatInfo::Get(log_key.format) : nullptr;
+    REXSYS_WARN(
+        "Vulkan RequestSwapTexture #{} {} valid={} scaled={} tiled={} base={:08X} "
+        "mip={:08X} size={}x{} depth={} format={} source={} frontbuffer={:08X} {}x{} "
+        "fetch0={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} texture={} view={:016X}",
+        swap_texture_log_count, stage, bool(log_key.is_valid), bool(log_key.scaled_resolve),
+        bool(log_key.tiled), log_key.base_page << 12, log_key.mip_page << 12,
+        log_key.is_valid ? log_key.GetWidth() : 0, log_key.is_valid ? log_key.GetHeight() : 0,
+        log_key.is_valid ? log_key.GetDepthOrArraySize() : 0,
+        format_info ? format_info->name : "invalid",
+        using_explicit_frontbuffer_key ? "frontbuffer" : "fetch0", frontbuffer_ptr,
+        frontbuffer_width, frontbuffer_height, fetch.dword_0, fetch.dword_1, fetch.dword_2,
+        fetch.dword_3, fetch.dword_4, fetch.dword_5, log_texture ? 1 : 0,
+        uint64_t(uintptr_t(log_view)));
+    ++swap_texture_log_count;
+  };
+  log_swap_texture("key", key);
+  if (key.is_valid && key.base_page != 0 && swap_texture_log_count < 32) {
+    const uint32_t base_address = key.base_page << 12;
+    const uint32_t sample_dwords =
+        std::min<uint32_t>(key.GetWidth() * key.GetHeight(), 1280u * 720u);
+    const uint32_t* sample =
+        reinterpret_cast<const uint32_t*>(shared_memory().DebugTranslatePhysical(base_address));
+    uint32_t nonzero = 0;
+    uint32_t first_nonzero_offset = UINT32_MAX;
+    uint32_t first_nonzero_value = 0;
+    uint32_t xor_checksum = 0;
+    if (sample != nullptr) {
+      for (uint32_t i = 0; i < sample_dwords; ++i) {
+        uint32_t value = sample[i];
+        xor_checksum ^= value;
+        if (value != 0 && first_nonzero_offset == UINT32_MAX) {
+          first_nonzero_offset = i * sizeof(uint32_t);
+          first_nonzero_value = value;
+        }
+        nonzero += uint32_t(value != 0);
+      }
+    }
+    REXSYS_WARN(
+        "Vulkan RequestSwapTexture source sample base={:08X} dwords={} sample_ptr={} nonzero={} "
+        "first_nonzero_off={} first_nonzero={:08X} xor={:08X}",
+        base_address, sample_dwords, sample != nullptr, nonzero,
+        first_nonzero_offset == UINT32_MAX ? -1 : int32_t(first_nonzero_offset),
+        first_nonzero_value, xor_checksum);
+  }
   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
+    log_swap_texture("invalid", key);
     return nullptr;
   }
   VulkanTexture* texture = static_cast<VulkanTexture*>(FindOrCreateTexture(key));
   if (!texture) {
+    log_swap_texture("find-failed", key);
     return VK_NULL_HANDLE;
   }
-  uint32_t host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
+  if (REXCVAR_GET(vulkan_debug_swap_ignore_scaled_resolve) && texture->key().scaled_resolve) {
+    TextureKey unscaled_key = texture->key();
+    unscaled_key.scaled_resolve = 0;
+    VulkanTexture* unscaled_texture = static_cast<VulkanTexture*>(FindOrCreateTexture(unscaled_key));
+    if (unscaled_texture) {
+      texture = unscaled_texture;
+      log_swap_texture("force-shared-memory", texture->key(), texture);
+    } else {
+      log_swap_texture("force-shared-memory-failed", unscaled_key);
+    }
+  }
+  uint32_t guest_swizzle = using_explicit_frontbuffer_key ? xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA
+                                                          : fetch.swizzle;
+  uint32_t host_swizzle = GuestToHostSwizzle(guest_swizzle, GetHostFormatSwizzle(key));
   if (swap_source_needs_rb_swap_out) {
     auto swizzle_component = [](uint32_t swizzle,
                                 uint32_t component_index) -> xenos::XE_GPU_TEXTURE_SWIZZLE {
@@ -1040,11 +1144,14 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   }
   VkImageView texture_view = texture->GetView(false, host_swizzle, false);
   if (texture_view == VK_NULL_HANDLE) {
+    log_swap_texture("view-failed", texture->key(), texture);
     return VK_NULL_HANDLE;
   }
   if (!LoadTextureData(*texture)) {
+    log_swap_texture("load-failed", texture->key(), texture, texture_view);
     return VK_NULL_HANDLE;
   }
+  log_swap_texture("load-ok", texture->key(), texture, texture_view);
   texture->MarkAsUsed();
   VulkanTexture::Usage old_usage = texture->SetUsage(VulkanTexture::Usage::kSwapSampled);
   if (old_usage != VulkanTexture::Usage::kSwapSampled) {
@@ -1595,6 +1702,95 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   if (write_descriptor_set_count) {
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
+  }
+  int32_t source_sample_logs_remaining =
+      REXCVAR_GET(vulkan_debug_log_texture_source_samples_remaining);
+  if (source_sample_logs_remaining > 0 && !texture_key.scaled_resolve && level_first == 0 &&
+      debug_source_base_range != 0 && debug_source_base_start < SharedMemory::kBufferSize) {
+    const uint8_t* source =
+        shared_memory().DebugTranslatePhysical(uint32_t(debug_source_base_start));
+    uint64_t sample_available = std::min(
+        debug_source_base_range, uint64_t(SharedMemory::kBufferSize) - debug_source_base_start);
+    sample_available = std::min(sample_available, uint64_t(vulkan_texture.GetGuestBaseSize()));
+    const uint32_t sample_length =
+        uint32_t(std::min<uint64_t>(sample_available, UINT32_C(4) << 20));
+    if (source != nullptr && sample_length != 0) {
+      REXCVAR_SET(vulkan_debug_log_texture_source_samples_remaining,
+                  source_sample_logs_remaining - 1);
+      uint32_t nonzero_count = 0;
+      uint32_t first_nonzero_offset = UINT32_MAX;
+      uint32_t last_nonzero_offset = UINT32_MAX;
+      uint8_t first_nonzero_value = 0;
+      uint8_t last_nonzero_value = 0;
+      uint8_t min_value = UINT8_MAX;
+      uint8_t max_value = 0;
+      uint32_t xor_checksum = 0;
+      uint64_t byte_sum = 0;
+      uint64_t fnv1a = UINT64_C(14695981039346656037);
+      for (uint32_t i = 0; i < sample_length; ++i) {
+        uint8_t value = source[i];
+        nonzero_count += uint32_t(value != 0);
+        if (value != 0) {
+          if (first_nonzero_offset == UINT32_MAX) {
+            first_nonzero_offset = i;
+            first_nonzero_value = value;
+          }
+          last_nonzero_offset = i;
+          last_nonzero_value = value;
+        }
+        min_value = std::min(min_value, value);
+        max_value = std::max(max_value, value);
+        xor_checksum ^= uint32_t(value) << ((i & 3) * 8);
+        byte_sum += value;
+        fnv1a ^= value;
+        fnv1a *= UINT64_C(1099511628211);
+      }
+      const FormatInfo* format_info = FormatInfo::Get(texture_key.format);
+      uint8_t head[16] = {};
+      std::memcpy(head, source, std::min<size_t>(sizeof(head), sample_length));
+      const uint32_t sample_mid = sample_length / 2;
+      const uint32_t sample_last = sample_length - 1;
+      static uint32_t source_sample_log_count = 0;
+      REXGPU_WARN(
+          "Vulkan texture source sample #{}: {} {}x{}x{} format={} shader={} "
+          "base={:08X}+{:X}, source={:X}+{:X}, sample_len={:X}, nonzero={}, "
+          "min={}, max={}, sum={}, first_nonzero={}:{} last_nonzero={}:{} "
+          "xor={:08X}, hash={:016X}, probes={:02X}/{:02X}/{:02X}, "
+          "head={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}"
+          "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+          source_sample_log_count, texture_key.tiled ? "tiled" : "linear", width, height,
+          depth_or_array_size, format_info ? format_info->name : "invalid",
+          uint32_t(load_shader), texture_key.base_page << 12, vulkan_texture.GetGuestBaseSize(),
+          debug_source_base_start, debug_source_base_range, sample_length, nonzero_count,
+          min_value, max_value, byte_sum,
+          first_nonzero_offset == UINT32_MAX ? -1 : int32_t(first_nonzero_offset),
+          first_nonzero_value,
+          last_nonzero_offset == UINT32_MAX ? -1 : int32_t(last_nonzero_offset),
+          last_nonzero_value, xor_checksum, fnv1a, source[0], source[sample_mid],
+          source[sample_last], head[0], head[1], head[2], head[3], head[4], head[5], head[6],
+          head[7], head[8], head[9], head[10], head[11], head[12], head[13], head[14],
+          head[15]);
+      ++source_sample_log_count;
+    }
+  }
+  static uint32_t swap_upload_log_count = 0;
+  if (swap_upload_log_count < 32 && texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+      texture_key.base_page != 0 && width >= 640 && height >= 360) {
+    const FormatInfo* format_info = FormatInfo::Get(texture_key.format);
+    REXGPU_INFO(
+        "Vulkan texture upload #{} candidate scaled={} load_base={} load_mips={} "
+        "{} {}x{}x{} format={} shader={} source_buffer={} source_base={:X}+{:X} "
+        "source_mips={:X}+{:X} guest_base={:08X}+{:X} guest_mips={:08X}+{:X} "
+        "host_buffer_size={:X} texture_scale={}x{} levels={}..{} packed={}",
+        swap_upload_log_count, bool(texture_key.scaled_resolve), load_base, load_mips,
+        texture_key.tiled ? "tiled" : "linear", width, height, depth_or_array_size,
+        format_info ? format_info->name : "invalid", uint32_t(load_shader),
+        texture_key.scaled_resolve ? "scaled-resolve" : "shared-memory", debug_source_base_start,
+        debug_source_base_range, debug_source_mips_start, debug_source_mips_range,
+        texture_key.base_page << 12, vulkan_texture.GetGuestBaseSize(), texture_key.mip_page << 12,
+        vulkan_texture.GetGuestMipsSize(), uint64_t(host_buffer_size), texture_resolution_scale_x,
+        texture_resolution_scale_y, level_first, level_last, level_packed);
+    ++swap_upload_log_count;
   }
   uint32_t debug_team_profile_base_serial = 0;
   uint32_t debug_team_profile_mips_serial = 0;

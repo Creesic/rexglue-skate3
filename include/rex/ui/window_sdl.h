@@ -8,7 +8,6 @@
 #include <rex/ui/window.h>
 
 #include <SDL3/SDL_events.h>
-#include <SDL3/SDL_metal.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 
@@ -58,8 +57,6 @@ class SDLWindow final : public Window {
   uint32_t QueryDpi() const;
 
   SDL_Window* window_ = nullptr;
-  SDL_MetalView metal_view_ = nullptr;
-  void* metal_layer_ = nullptr;
   std::atomic<bool> paint_event_queued_{false};
   SDL_TimerID cursor_auto_hide_timer_ = 0;
   bool cursor_currently_auto_hidden_ = false;

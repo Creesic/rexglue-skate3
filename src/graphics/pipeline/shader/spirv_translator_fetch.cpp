@@ -11,6 +11,7 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -22,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
 namespace rex::graphics {
@@ -29,10 +31,55 @@ namespace rex::graphics {
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
+  xenos::VertexFormat data_format = instr.attributes.data_format;
+  if (is_pixel_shader() && data_format == xenos::VertexFormat::kUndefined) {
+    // PGR3 uses pixel-shader vfetch with format 0 as raw float4 data.
+    data_format = xenos::VertexFormat::k_32_32_32_32_FLOAT;
+  }
+  if (is_pixel_shader() &&
+      current_shader().ucode_data_hash() == UINT64_C(0x6AE1AEA35BF4FF68)) {
+    static uint32_t pgr3_pixel_vfetch_translate_log_count = 0;
+    if (pgr3_pixel_vfetch_translate_log_count < 32) {
+      std::fprintf(stderr,
+                   "[rexglue-spirv] PGR3 PS vfetch translate #%u shader=%016llX "
+                   "mini=%u dst=r%u src=r%u.%u vf=%u format=%u translated_format=%u "
+                   "stride=%u offset=%d rounded=%u signed=%u integer=%u normalized=%u "
+                   "write_mask=%X used_components=%X\n",
+                   pgr3_pixel_vfetch_translate_log_count,
+                   static_cast<unsigned long long>(current_shader().ucode_data_hash()),
+                   instr.is_mini_fetch ? 1u : 0u, instr.result.storage_index,
+                   instr.operands[0].storage_index, uint32_t(instr.operands[0].components[0]),
+                   instr.operands[1].storage_index, uint32_t(instr.attributes.data_format),
+                   uint32_t(data_format), instr.attributes.stride, instr.attributes.offset,
+                   instr.attributes.is_index_rounded ? 1u : 0u, instr.attributes.is_signed ? 1u : 0u,
+                   instr.attributes.is_integer ? 1u : 0u,
+                   instr.attributes.is_integer ? 0u : 1u, instr.result.GetUsedWriteMask(),
+                   instr.result.GetUsedResultComponents());
+      std::fflush(stderr);
+      ++pgr3_pixel_vfetch_translate_log_count;
+    }
+  }
+  if (is_pixel_shader() && GetSpirvShaderModification().pixel.debug_force_vfetch_color) {
+    static uint32_t debug_pixel_vfetch_translate_log_count = 0;
+    if (debug_pixel_vfetch_translate_log_count < 32) {
+      REXGPU_WARN(
+          "SPIR-V debug pixel vfetch translate #{}: shader={:016X}, modification={:016X}, "
+          "mode={}, mini={}, dst=r{}, src=r{}.{}, vf={}, format={}, stride={}, offset={}, "
+          "write_mask={:X}",
+          debug_pixel_vfetch_translate_log_count, current_shader().ucode_data_hash(),
+          current_translation().modification(),
+          GetSpirvShaderModification().pixel.debug_force_vfetch_color, instr.is_mini_fetch,
+          instr.result.storage_index, instr.operands[0].storage_index,
+          uint32_t(instr.operands[0].components[0]), instr.operands[1].storage_index,
+          uint32_t(instr.attributes.data_format), instr.attributes.stride, instr.attributes.offset,
+          instr.result.GetUsedWriteMask());
+      ++debug_pixel_vfetch_translate_log_count;
+    }
+  }
 
   uint32_t used_result_components = instr.result.GetUsedResultComponents();
   uint32_t needed_words =
-      xenos::GetVertexFormatNeededWords(instr.attributes.data_format, used_result_components);
+      xenos::GetVertexFormatNeededWords(data_format, used_result_components);
   // If this is vfetch_full, the address may still be needed for vfetch_mini -
   // don't exit before calculating the address.
   if (!needed_words && instr.is_mini_fetch) {
@@ -163,7 +210,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   // Convert the format.
   uint32_t used_format_components =
       used_result_components &
-      ((1 << xenos::GetVertexFormatComponentCount(instr.attributes.data_format)) - 1);
+      ((1 << xenos::GetVertexFormatComponentCount(data_format)) - 1);
   // If needed_words is not zero (checked in the beginning), this must not be
   // zero too. For simplicity, it's assumed that something will be unpacked
   // here.
@@ -173,7 +220,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   bool format_is_packed = false;
   int packed_widths[4] = {}, packed_offsets[4] = {};
   uint32_t packed_words[4] = {};
-  switch (instr.attributes.data_format) {
+  switch (data_format) {
     case xenos::VertexFormat::k_8_8_8_8:
       format_is_packed = true;
       packed_widths[0] = packed_widths[1] = packed_widths[2] = packed_widths[3] = 8;
@@ -314,7 +361,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
       break;
 
     default:
-      assert_unhandled_case(instr.attributes.data_format);
+      assert_unhandled_case(data_format);
   }
 
   if (format_is_packed) {
@@ -465,6 +512,43 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
           const_float_vectors_0_[rex::bit_count(used_missing_components) - 1]);
       result = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
+    }
+  }
+  if (is_pixel_shader() && var_main_debug_vfetch_value_ != spv::NoResult) {
+    const uint32_t debug_force_vfetch_color =
+        GetSpirvShaderModification().pixel.debug_force_vfetch_color;
+    spv::Id debug_value = spv::NoResult;
+    if (debug_force_vfetch_color == 2) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_float_0_);
+      id_vector_temp_.push_back(const_float_1_);
+      id_vector_temp_.push_back(const_float_1_);
+      id_vector_temp_.push_back(const_float_1_);
+      debug_value = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+    } else if (result != spv::NoResult) {
+      const unsigned int component_count =
+          std::min<unsigned int>(builder_->getNumComponents(result), 4);
+      id_vector_temp_.clear();
+      for (unsigned int i = 0; i < 4; ++i) {
+        if (i < component_count) {
+          id_vector_temp_.push_back(component_count > 1
+                                        ? builder_->createCompositeExtract(result, type_float_, i)
+                                        : result);
+        } else {
+          id_vector_temp_.push_back(i == 3 ? const_float_1_ : const_float_0_);
+        }
+      }
+      debug_value = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+    }
+    if (debug_value != spv::NoResult && debug_force_vfetch_color == 1) {
+      debug_value = builder_->createUnaryBuiltinCall(
+          type_float4_, ext_inst_glsl_std_450_, GLSLstd450FAbs, debug_value);
+      debug_value = builder_->createBinBuiltinCall(
+          type_float4_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+          builder_->createLoad(var_main_debug_vfetch_value_, spv::NoPrecision), debug_value);
+    }
+    if (debug_value != spv::NoResult) {
+      builder_->createStore(debug_value, var_main_debug_vfetch_value_);
     }
   }
   StoreResult(instr.result, result);

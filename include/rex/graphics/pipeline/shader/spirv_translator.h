@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 16;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // Debug-only override to prove whether a draw reaches rasterization.
+      uint32_t debug_force_position_mode : 2;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -88,6 +90,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Debug-only forced color output mode.
+      uint32_t debug_force_color : 3;
+      // Debug-only output of pixel shader vfetch values.
+      uint32_t debug_force_vfetch_color : 2;
     } pixel;
     uint64_t value = 0;
 
@@ -396,6 +402,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool rounding_mode_rte_float32;
 
     bool fragment_shader_sample_interlock;
+    bool shader_stencil_export;
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
@@ -948,6 +955,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_or_var_fragment_data_;
   // For host render targets and only when needed - float.
   spv::Id output_fragment_depth_;
+  // For host render targets and only when needed - int.
+  spv::Id output_fragment_stencil_ref_;
   // For host render targets and only when needed - int[1].
   spv::Id output_fragment_sample_mask_;
 
@@ -967,6 +976,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // `base + index * stride` in dwords from the last vfetch_full as it may be
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
+  // PS debug only - float4 containing a vfetch result selected for output.
+  spv::Id var_main_debug_vfetch_value_;
   // float.
   spv::Id var_main_tfetch_lod_;
   // float3.

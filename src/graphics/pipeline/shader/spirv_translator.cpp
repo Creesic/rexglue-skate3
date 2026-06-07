@@ -41,6 +41,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
+      shader_stencil_export(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all) {}
 
@@ -58,6 +59,7 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
+      shader_stencil_export(vulkan_device->extensions().ext_EXT_shader_stencil_export),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
@@ -130,12 +132,14 @@ void SpirvShaderTranslator::Reset() {
   type_output_per_vertex_ = spv::NoResult;
   output_per_vertex_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
+  output_fragment_stencil_ref_ = spv::NoResult;
   output_fragment_sample_mask_ = spv::NoResult;
 
   sampler_bindings_.clear();
   texture_bindings_.clear();
 
   main_interface_.clear();
+  var_main_debug_vfetch_value_ = spv::NoResult;
   var_main_registers_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
@@ -497,6 +501,11 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_vfetch_address_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
+    if (is_pixel_shader() && GetSpirvShaderModification().pixel.debug_force_vfetch_color) {
+      var_main_debug_vfetch_value_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                   "xe_var_debug_vfetch_value", const_float4_0_);
+    }
     var_main_tfetch_lod_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_tfetch_lod", const_float_0_);
@@ -1163,6 +1172,50 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   if (is_vertex_shader() && !IsSpirvComputeShader() && !rectangle_vertex_loop) {
     CompleteVertexOrTessEvalShaderInMain();
   } else if (is_pixel_shader()) {
+    uint32_t debug_force_color = GetSpirvShaderModification().pixel.debug_force_color;
+    uint32_t color_targets_written = current_shader().writes_color_targets();
+    if (debug_force_color && color_targets_written) {
+      spv::Id red = debug_force_color == 1 || debug_force_color == 4 ? const_float_1_ : const_float_0_;
+      spv::Id green =
+          debug_force_color == 2 || debug_force_color == 4 ? const_float_1_ : const_float_0_;
+      spv::Id blue = debug_force_color == 3 || debug_force_color == 4 ? const_float_1_ : const_float_0_;
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(red);
+      id_vector_temp_.push_back(green);
+      id_vector_temp_.push_back(blue);
+      id_vector_temp_.push_back(const_float_1_);
+      spv::Id debug_color = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+      uint32_t color_targets_remaining = color_targets_written;
+      uint32_t color_target_index;
+      while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
+        color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
+        spv::Id output_or_var_fragment_data = output_or_var_fragment_data_[color_target_index];
+        if (output_or_var_fragment_data != spv::NoResult) {
+          builder_->createStore(debug_color, output_or_var_fragment_data);
+        }
+      }
+      if (edram_fragment_shader_interlock_ && var_main_fsi_color_written_ != spv::NoResult) {
+        builder_->createStore(builder_->makeUintConstant(color_targets_written),
+                              var_main_fsi_color_written_);
+      }
+    }
+    if (var_main_debug_vfetch_value_ != spv::NoResult && color_targets_written) {
+      spv::Id debug_color =
+          builder_->createLoad(var_main_debug_vfetch_value_, spv::NoPrecision);
+      uint32_t color_targets_remaining = color_targets_written;
+      uint32_t color_target_index;
+      while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
+        color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
+        spv::Id output_or_var_fragment_data = output_or_var_fragment_data_[color_target_index];
+        if (output_or_var_fragment_data != spv::NoResult) {
+          builder_->createStore(debug_color, output_or_var_fragment_data);
+        }
+      }
+      if (edram_fragment_shader_interlock_ && var_main_fsi_color_written_ != spv::NoResult) {
+        builder_->createStore(builder_->makeUintConstant(color_targets_written),
+                              var_main_fsi_color_written_);
+      }
+    }
     CompleteFragmentShaderInMain();
   }
 
@@ -1181,6 +1234,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
               Modification::DepthStencilMode::kFloat24Truncating) {
         builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthLess);
       }
+    }
+    if (output_fragment_stencil_ref_ != spv::NoResult) {
+      builder_->addExecutionMode(function_main_, spv::ExecutionModeStencilRefReplacingEXT);
     }
     if (IsExecutionModeEarlyFragmentTests()) {
       builder_->addExecutionMode(function_main_, spv::ExecutionModeEarlyFragmentTests);
@@ -2462,7 +2518,53 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
   spv::Id position_ptr =
       builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
-  spv::Id guest_position = builder_->createLoad(position_ptr, spv::NoPrecision);
+
+  if (shader_modification.vertex.debug_force_position_mode == 1) {
+    spv::Id vertex_index = builder_->createUnaryOp(
+        spv::OpBitcast, type_uint_, builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+    spv::Id triangle_vertex =
+        builder_->createBinOp(spv::OpUMod, type_uint_, vertex_index, builder_->makeUintConstant(3));
+    spv::Id is_vertex_1 = builder_->createBinOp(
+        spv::OpIEqual, type_bool_, triangle_vertex, builder_->makeUintConstant(1));
+    spv::Id is_vertex_2 = builder_->createBinOp(
+        spv::OpIEqual, type_bool_, triangle_vertex, builder_->makeUintConstant(2));
+    spv::Id position_x = builder_->createTriOp(spv::OpSelect, type_float_, is_vertex_2,
+                                               builder_->makeFloatConstant(3.0f),
+                                               builder_->makeFloatConstant(-1.0f));
+    spv::Id position_y = builder_->createTriOp(spv::OpSelect, type_float_, is_vertex_1,
+                                               builder_->makeFloatConstant(3.0f),
+                                               builder_->makeFloatConstant(-1.0f));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(position_x);
+    id_vector_temp_.push_back(position_y);
+    id_vector_temp_.push_back(const_float_0_);
+    id_vector_temp_.push_back(const_float_1_);
+    builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                          position_ptr);
+    return;
+  }
+  if (shader_modification.vertex.debug_force_position_mode == 3) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    builder_->createStore(
+        builder_->createLoad(builder_->createAccessChain(spv::StorageClassFunction,
+                                                         var_main_registers_, id_vector_temp_),
+                             spv::NoPrecision),
+        position_ptr);
+    return;
+  }
+
+  spv::Id guest_position;
+  if (shader_modification.vertex.debug_force_position_mode == 2) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    guest_position = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+  } else {
+    guest_position = builder_->createLoad(position_ptr, spv::NoPrecision);
+  }
 
   // Check if the shader already returns W, not 1/W, and if it doesn't, turn 1/W
   // into W.
@@ -2987,6 +3089,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
     }
     output_fragment_depth_ = spv::NoResult;
+    output_fragment_stencil_ref_ = spv::NoResult;
     output_fragment_sample_mask_ = spv::NoResult;
     if (current_shader().writes_depth() || float24_depth_conversion) {
       output_fragment_depth_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
@@ -2994,6 +3097,16 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       builder_->addDecoration(output_fragment_depth_, spv::DecorationBuiltIn,
                               spv::BuiltInFragDepth);
       main_interface_.push_back(output_fragment_depth_);
+    }
+    if (current_shader().writes_stencil_reference() && features_.shader_stencil_export) {
+      builder_->addExtension("SPV_EXT_shader_stencil_export");
+      builder_->addCapability(spv::CapabilityStencilExportEXT);
+      output_fragment_stencil_ref_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput, type_int_,
+                                   "gl_FragStencilRefARB");
+      builder_->addDecoration(output_fragment_stencil_ref_, spv::DecorationBuiltIn,
+                              spv::BuiltInFragStencilRefEXT);
+      main_interface_.push_back(output_fragment_stencil_ref_);
     }
     if (alpha_to_coverage_possible && features_.sample_rate_shading) {
       output_fragment_sample_mask_ = builder_->createVariable(
@@ -3331,6 +3444,9 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
       // Keep output deterministic if oDepth is not written on a control flow
       // path.
       builder_->createStore(const_float_0_, output_fragment_depth_);
+    }
+    if (output_fragment_stencil_ref_ != spv::NoResult) {
+      builder_->createStore(const_int_0_, output_fragment_stencil_ref_);
     }
   }
 }
@@ -3691,6 +3807,12 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
       // Guest depth output is expected to be [0, 1].
       is_clamped = true;
     } break;
+    case InstructionStorageTarget::kStencilReference: {
+      assert_true(is_pixel_shader());
+      assert_true(used_write_mask == 0b0001);
+      assert_true(current_shader().writes_stencil_reference());
+      target_pointer = output_fragment_stencil_ref_;
+    } break;
     case InstructionStorageTarget::kExportAddress: {
       if (!can_store_memexport_address) {
         return;
@@ -3959,6 +4081,13 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
     value_to_store = builder_->createCompositeInsert(
         builder_->createUnaryOp(spv::OpBitcast, type_float_, point_size), value_to_store,
         type_float3_, 0);
+  }
+
+  if (result.storage_target == InstructionStorageTarget::kStencilReference) {
+    assert_true(builder_->getNumTypeComponents(builder_->getTypeId(value_to_store)) == 1);
+    value_to_store = builder_->createUnaryOp(
+        spv::OpBitcast, type_int_,
+        builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, value_to_store));
   }
 
   builder_->createStore(value_to_store, target_pointer);
