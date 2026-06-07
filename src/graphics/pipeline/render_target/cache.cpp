@@ -405,13 +405,15 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
-  assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
   if (msaa_samples > xenos::MsaaSamples::k4X) {
-    // Safety check because a lot of code assumes up to 4x.
-    assert_always();
-    REXGPU_ERROR("{}x MSAA requested by the guest, Xenos only supports up to 4x",
-                 uint32_t(1) << uint32_t(msaa_samples));
-    return false;
+    static uint32_t msaa_clamp_log_count = 0;
+    if (msaa_clamp_log_count < 32) {
+      REXGPU_WARN(
+          "{}x MSAA requested by the guest, clamping to 4x",
+          uint32_t(1) << uint32_t(msaa_samples));
+      ++msaa_clamp_log_count;
+    }
+    msaa_samples = xenos::MsaaSamples::k4X;
   }
   uint32_t msaa_samples_x_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
   uint32_t pitch_pixels = rb_surface_info.surface_pitch;

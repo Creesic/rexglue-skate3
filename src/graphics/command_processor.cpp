@@ -1343,9 +1343,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     auto endian = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     uint32_t value = xenos::GpuSwap(*reinterpret_cast<uint32_t*>(addr), endian);
     if ((value & mask) != ref) {
-      REXGPU_INFO("WAIT_REG_MEM: forcing addr=0x{:08X} val=0x{:08X} -> ref=0x{:08X}",
-                  poll_reg_addr, value, ref);
+      static uint32_t force_log_count = 0;
+      if (force_log_count < 32) {
+        REXGPU_INFO("WAIT_REG_MEM: forcing addr=0x{:08X} val=0x{:08X} -> ref=0x{:08X}",
+                    poll_reg_addr, value, ref);
+        ++force_log_count;
+      }
       *reinterpret_cast<uint32_t*>(addr) = xenos::GpuSwap(ref, endian);
+      PrepareForWait();
+      rex::thread::MaybeYield();
     }
     return true;
   }

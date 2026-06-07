@@ -797,7 +797,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // top-left rasterization rule.
   // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
   xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
+  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size < 3 * 2) {
     static uint32_t resolve_info_fetch_fail_log_count = 0;
     if (resolve_info_fetch_fail_log_count < 128) {
       std::fprintf(stderr,
@@ -811,6 +811,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     REXGPU_ERROR("Unsupported resolve vertex buffer format");
     assert_always();
     return false;
+  }
+  if (fetch.size > 3 * 2) {
+    static uint32_t resolve_info_fetch_size_log_count = 0;
+    if (resolve_info_fetch_size_log_count < 32) {
+      REXGPU_WARN("GetResolveInfo vertex fetch size {} > 6, using first 6 floats",
+                  uint32_t(fetch.size));
+      ++resolve_info_fetch_size_log_count;
+    }
   }
   trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t), fetch.size * sizeof(uint32_t));
   const float* vertices_guest =
@@ -888,23 +896,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   if (rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
-    static uint32_t resolve_info_msaa_fail_log_count = 0;
-    if (resolve_info_msaa_fail_log_count < 128) {
-      std::fprintf(stderr,
-                   "[rexglue-vulkan] GetResolveInfo unsupported msaa #%u msaa=%u "
-                   "surface_pitch=%u\n",
-                   resolve_info_msaa_fail_log_count, uint32_t(rb_surface_info.msaa_samples),
-                   uint32_t(rb_surface_info.surface_pitch));
-      std::fflush(stderr);
-      ++resolve_info_msaa_fail_log_count;
+    static uint32_t resolve_msaa_clamp_log_count = 0;
+    if (resolve_msaa_clamp_log_count < 32) {
+      REXGPU_WARN(
+          "{}x MSAA requested in resolve, clamping to 4x",
+          uint32_t(1) << uint32_t(rb_surface_info.msaa_samples));
+      ++resolve_msaa_clamp_log_count;
     }
-    // Safety check because a lot of code assumes up to 4x.
-    assert_always();
-    REXGPU_ERROR(
-        "{}x MSAA requested by the guest in a resolve, Xenos only supports up "
-        "to 4x",
-        uint32_t(1) << uint32_t(rb_surface_info.msaa_samples));
-    return false;
+    rb_surface_info.msaa_samples = xenos::MsaaSamples::k4X;
   }
 
   // Clamp to the EDRAM surface pitch (maximum possible surface pitch is also
